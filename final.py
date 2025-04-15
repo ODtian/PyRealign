@@ -183,59 +183,68 @@ class Realign:
 
         interpolator = self.interpolator  # B样条插值(B-spline interpolation)
         step = self.step  # 选点间隔(point interval)
-        bi = np.zeros(self.x*self.y*self.z)    # 残差 (residual)
-        # 偏导矩阵 (derivative matrix)
-        b_diff = np.zeros(((self.x*self.y*self.z), 7))
-        index = 0
-        for i in range(self.x):
-            for j in range(self.y):
-                for k in range(self.z):
-                    n_i = i*step  # 对应位置的转换,获得点在原图的位置(get the position of the point in the original image)
-                    n_j = j*step
-                    n_k = k*step
-                    M = self.rigid(q)
-                    M[3,3]=0.0
-                    if np.linalg.det(M) <= 1e-10:  # 判断矩阵是否可逆
-                        interpo_pos = np.linalg.pinv(M)@[n_i, n_j, n_k, 1]
-                    else:
-                        interpo_pos =np.linalg.inv(M)@[n_i, n_j, n_k, 1]
-                    point = itk.Point[itk.D, 4]() 
-                    if 0 <= interpo_pos[0] < self.shape[1] and 0 <= interpo_pos[1] < self.shape[2] and 0 <= interpo_pos[2] < self.shape[3]:  # 判断是否在范围内
-                        point[0] = pic_num
-                        point[1] = interpo_pos[0]
-                        point[2] = interpo_pos[1]
-                        point[3] = interpo_pos[2]
 
-                    else:
-                        point[1] = n_i
-                        point[2] = n_j
-                        point[3] = n_k
-                        point[0] = pic_num
-                        
-                    bi[index] = (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
-                    tem=interpolator.Evaluate(point)-reference[n_i][n_j][n_k]
-                    derivative = interpolator.EvaluateDerivative(point)
-                    diff_x = derivative[1]
-                    diff_y = derivative[2]
-                    diff_z = derivative[3]
-                    (a,b,c)=self.shape[1:]
-                    b_diff[index][1:4] = diff_x*tem, diff_y*tem, diff_z*tem
-                    b_diff[index][4] = (diff_y*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[1][1] + self.affine[0][0]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[1][1] - 0.5*b*(-sin(q[4])*cos(q[6]) - sin(q[5])*sin(q[6])*cos(q[4])) - sin(q[4])*cos(q[6]) - sin(q[5])*sin(q[6])*cos(q[4]) - 0.5*self.affine[2][2]*c*cos(q[4])*cos(q[5])/self.affine[1][1] + self.affine[2][2]*cos(q[4])*cos(q[5])/self.affine[1][1]) + \
-                        diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[5])*cos(q[6]) + sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*sin(q[5])*cos(q[6]) + sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(
-                            sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + 0.5*c*sin(q[4])*cos(q[5]) - sin(q[4])*cos(q[5])))*tem
+        
+        total = self.x * self.y * self.z
+        
+        start = rank * (total // size)  # 每个进程处理的起始索引
+        end = (rank + 1) * (total // size) if rank != size - 1 else total  # 每个进程处理的结束索引
+        
+        bi = np.zeros(end - start)  # 残差 (residual)   
+        b_diff = np.zeros(((end - start), 7))  # 偏导矩阵 (derivative matrix)
 
-                    b_diff[index][5] = (diff_x*(0.5*a*sin(q[5])*cos(q[6]) - sin(q[5])*cos(q[6]) + 0.5*self.affine[1][1]*b*sin(q[5])*sin(q[6])/self.affine[0][0] - self.affine[1][1]*sin(q[5])*sin(q[6])/self.affine[0][0] - 0.5*self.affine[2][2]*c*cos(q[5])/self.affine[0][0] + self.affine[2][2]*cos(q[5])/self.affine[0][0]) +\
-                        diff_y*(0.5*self.affine[0][0]*a*sin(q[4])*cos(q[5])*cos(q[6])/self.affine[1][1] - self.affine[0][0]*sin(q[4])*cos(q[5])*cos(q[6])/self.affine[1][1] + 0.5*b*sin(q[4])*sin(q[6])*cos(q[5]) - sin(q[4])*sin(q[6])*cos(q[5]) + 0.5*self.affine[2][2]*c*sin(q[4])*sin(q[5])/self.affine[1][1] - self.affine[2][2]*sin(q[4])*sin(q[5])/self.affine[1][1]) +\
-                        diff_z*(0.5*self.affine[0][0]*a*cos(q[4])*cos(q[5])*cos(q[6])/self.affine[2][2] - self.affine[0][0]*cos(q[4])*cos(q[5])*cos(q[6])/self.affine[2][2] + 0.5*self.affine[1][1]*b*sin(
-                            q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] - self.affine[1][1]*sin(q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] + 0.5*c*sin(q[5])*cos(q[4]) - sin(q[5])*cos(q[4])))*tem
-
-                    b_diff[index][6] = (diff_x*(0.5*a*sin(q[6])*cos(q[5]) - sin(q[6])*cos(q[5]) - 0.5*self.affine[1][1]*b*cos(q[5])*cos(q[6])/self.affine[0][0] + self.affine[1][1]*cos(q[5])*cos(q[6])/self.affine[0][0]) +\
-                        diff_y*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[1][1] + self.affine[0][0]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[1][1] - 0.5*b*(-sin(q[4])*sin(q[5])*cos(q[6]) - sin(q[6])*cos(q[4])) - sin(q[4])*sin(q[5])*cos(q[6]) - sin(q[6])*cos(q[4])) +\
-                        diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2]
-                                [2] - 0.5*self.affine[1][1]*b*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2]))*tem
-
-                    b_diff[index][0] = 1
-                    index += 1
+        # 处理每个进程分配的图像
+        for index in range(start, end):
+            i = index // (self.y * self.z)
+            j = (index // self.z) % self.y
+            k = index % self.z
+            
+            n_i = i*step  # 对应位置的转换,获得点在原图的位置(get the position of the point in the original image)
+            n_j = j*step
+            n_k = k*step
+            M = self.rigid(q)
+            M[3,3]=0.0
+            if np.linalg.det(M) <= 1e-10:
+                interpo_pos = np.linalg.pinv(M)@[n_i, n_j, n_k, 1]
+            else:
+                interpo_pos =np.linalg.inv(M)@[n_i, n_j, n_k, 1]
+            point = itk.Point[itk.D, 4]()
+            if 0 <= interpo_pos[0] < self.shape[1] and 0 <= interpo_pos[1] < self.shape[2] and 0 <= interpo_pos[2] < self.shape[3]:  # 判断是否在范围内
+                point[0] = pic_num
+                point[1] = interpo_pos[0]
+                point[2] = interpo_pos[1]
+                point[3] = interpo_pos[2]
+            else:
+                point[1] = n_i
+                point[2] = n_j
+                point[3] = n_k
+                point[0] = pic_num
+            bi[index - start] = (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
+            tem=interpolator.Evaluate(point)-reference[n_i][n_j][n_k]
+            derivative = interpolator.EvaluateDerivative(point)
+            diff_x = derivative[1]
+            diff_y = derivative[2]
+            diff_z = derivative[3]
+            (a,b,c)=self.shape[1:]
+            b_diff[index - start][1:4] = diff_x*tem, diff_y*tem, diff_z*tem
+            b_diff[index - start][4] = (diff_y*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[1][1] + self.affine[0][0]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[1][1] - 0.5*b*(-sin(q[4])*cos(q[6]) - sin(q[5])*sin(q[6])*cos(q[4])) - sin(q[4])*cos(q[6]) - sin(q[5])*sin(q[6])*cos(q[4]) - 0.5*self.affine[2][2]*c*cos(q[4])*cos(q[5])/self.affine[1][1] + self.affine[2][2]*cos(q[4])*cos(q[5])/self.affine[1][1]) + \
+                diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[5])*cos(q[6]) + sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*sin(q[5])*cos(q[6]) + sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(
+                    sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + 0.5*c*sin(q[4])*cos(q[5]) - sin(q[4])*cos(q[5])))*tem
+            b_diff[index - start][5] = (diff_x*(0.5*a*sin(q[5])*cos(q[6]) - sin(q[5])*cos(q[6]) + 0.5*self.affine[1][1]*b*sin(q[5])*sin(q[6])/self.affine[0][0] - self.affine[1][1]*sin(q[5])*sin(q[6])/self.affine[0][0] - 0.5*self.affine[2][2]*c*cos(q[5])/self.affine[0][0] + self.affine[2][2]*cos(q[5])/self.affine[0][0]) +\
+                diff_y*(0.5*self.affine[0][0]*a*sin(q[4])*cos(q[5])*cos(q[6])/self.affine[1][1] - self.affine[0][0]*sin(q[4])*cos(q[5])*cos(q[6])/self.affine[1][1] + 0.5*b*sin(q[4])*sin(q[6])*cos(q[5]) - sin(q[4])*sin(q[6])*cos(q[5]) + 0.5*self.affine[2][2]*c*sin(q[4])*sin(q[5])/self.affine[1][1] - self.affine[2][2]*sin(q[4])*sin(q[5])/self.affine[1][1]) +\
+                diff_z*(0.5*self.affine[0][0]*a*cos(q[4])*cos(q[5])*cos(q[6])/self.affine[2][2] - self.affine[0][0]*cos(q[4])*cos(q[5])*cos(q[6])/self.affine[2][2] + 0.5*self.affine[1][1]*b*sin(
+                    q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] - self.affine[1][1]*sin(q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] + 0.5*c*sin(q[5])*cos(q[4]) - sin(q[5])*cos(q[4])))*tem
+            b_diff[index - start][6] = (diff_x*(0.5*a*sin(q[6])*cos(q[5]) - sin(q[6])*cos(q[5]) - 0.5*self.affine[1][1]*b*cos(q[5])*cos(q[6])/self.affine[0][0] + self.affine[1][1]*cos(q[5])*cos(q[6])/self.affine[0][0]) +\
+                diff_y*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[1][1] + self.affine[0][0]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[1][1] - 0.5*b*(-sin(q[4])*sin(q[5])*cos(q[6]) - sin(q[6])*cos(q[4])) - sin(q[4])*sin(q[5])*cos(q[6]) - sin(q[6])*cos(q[4])) +\
+                diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2]))*tem
+            b_diff[index - start][0] = 1
+            
+        # 汇总所有进程处理的结果
+        gathered_bi = np.zeros(total)  # 创建一个空数组用于存储汇总结果
+        gathered_b_diff = np.zeros((total, 7))  # 创建一个空数组用于存储汇总结果
+        
+        comm.Gatherv(bi, gathered_bi, root=0)  # 将每个进程处理的结果汇总到主进程
+        comm.Gatherv(b_diff, gathered_b_diff, root=0)  # 将每个进程处理的结果汇总到主进程
         return bi, b_diff
 
     def reslicing(self,name):
@@ -280,37 +289,36 @@ class Realign:
         Estimate the rigid-body transform parameter\n
         output: 刚体变换参数(Rigid-body transform parameter)'''
         
-        if rank == 0:
-            print("开始估计刚体变换参数\nestimating")
-            q=np.zeros(7)
-            q[0] = 1
-            for picture in range(1, self.shape[0]):
-                # 高斯牛顿迭代
-                q=q / self.beta
-                for _ in range(self.iteration):
-                    
-                    q[0]=1
-                    (b, diff_b) = self.iterate(self.img_data[0,:, :, :],self.img_data[picture,:,:,:], q,picture)
-                    
+        print("开始估计刚体变换参数\nestimating")
+        q=np.zeros(7)
+        q[0] = 1
+        for picture in range(1, self.shape[0]):
+            # 高斯牛顿迭代
+            q=q / self.beta
+            for _ in range(self.iteration):
+                
+                q[0] = 1
+                
+                comm.Bcast(q, root=0)  # 广播参数到所有进程
+                
+                (b, diff_b) = self.iterate(self.img_data[0,:, :, :],self.img_data[picture,:,:,:], q,picture)
+                
+                if rank == 0:
                     if np.linalg.det(diff_b.T@diff_b) <= 1e-10:  # 判断矩阵是否可逆
                         # 矩阵不可逆时用伪逆
                         q -= self.alpha * np.linalg.pinv(diff_b.T@diff_b)@diff_b.T@b
                     else:
                         q -= self.alpha * np.linalg.inv(diff_b.T@diff_b)@diff_b.T@b
-                q[0] = 1
-                q[q>40]=0
-                q[q<-40]=0
-                self.parameter[picture] = q/10
-                print(f"进度{picture*100/self.shape[0]}%", end="\r")
-            print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
+            q[0] = 1
+            q[q>40]=0
+            q[q<-40]=0
+            self.parameter[picture] = q/10
+            print(f"进度{picture*100/self.shape[0]}%", end="\r")
+        print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
+        
+        if rank == 0:
             self.draw_parameter()
-            
         self.parameter = comm.bcast(self.parameter, root=0)  # 广播参数到所有进程
-        
-        # request = comm.Ibcast(self.parameter, root=0)  # 异步广播参数到所有进程
-        
-        # while not request.Test():
-        #     time.sleep(0.1)  # 等待广播完成
         return self.parameter
 
     def save_img(self,img, name):
@@ -354,7 +362,7 @@ if __name__ == "__main__":
     start = time.perf_counter()
     
     ## 测验代码
-    realign = Realign('./data/sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz')
+    realign = Realign('./data/sub-Ey153_ses-3_task-rest_acq-EPI_run-2_bold.nii.gz')
 
     realign.set_step(2)
     realign.set_iteration(2)
