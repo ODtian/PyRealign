@@ -4,7 +4,13 @@ import itk
 import nibabel as nib
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
-import torch
+
+from mpi4py import MPI
+
+# MPI初始化
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()  # 获取当前进程的rank
+size = comm.Get_size()  # 获取总进程数
 
 class Realign:
     def __init__(self, path, sigma=1, iteration=1, order=1, step = 2, alpha = 1, beta = 1.2):
@@ -15,7 +21,11 @@ class Realign:
         # 读取数据(load data)
         self.path = path
         self.img = itk.imread(path)
-        self.img_data = itk.GetArrayFromImage(self.img)
+        if rank == 0:
+            self.img_data = itk.GetArrayFromImage(self.img)
+        else:
+            self.img_data = None
+        self.img_data = comm.bcast(self.img_data)
         # 记录数据信息(record data information)
         self.shape = self.img_data.shape
         spacing = self.img.GetSpacing()  # 体素间距(voxel spacing)
@@ -237,10 +247,30 @@ class Realign:
         
         print("开始重采样对齐(注意，需要很长时间，建议先去干点别的事)\nreslicing")
         new = np.ndarray(self.shape)
-        for picture in range(self.shape[0]):
-            new[picture,:, :, :] = self.get_new_img(self.img_data_gauss[picture,:, :, :], self.parameter[picture],picture)
-            print(f"进度{picture*100/self.shape[0]}%", end="\r")
-        self.save_img(new, name)
+        
+        start = rank * (self.shape[0] // size)  # 每个进程处理的起始索引
+        end = (rank + 1) * (self.shape[0] // size) if rank != size - 1 else self.shape[0]  # 每个进程处理的结束索引
+        # 处理每个进程分配的图像
+        seperate_img = self.img_data_gauss[start:end, :, :, :].copy()
+        for picture in range(start, end):
+            seperate_img[picture-start,:, :, :] = self.get_new_img(self.img_data_gauss[picture,:, :, :], self.parameter[picture],picture)
+            print(f"rank {rank}: 进度{(picture - start)*100/seperate_img.shape[0]}%")
+        # 汇总所有进程处理的结果
+        gathered_img = np.zeros_like(self.img_data_gauss)  # 创建一个空数组用于存储汇总结果
+        comm.Gather(seperate_img, gathered_img, root=0)  # 将每个进程处理的结果汇总到主进程
+        
+        # 主进程保存结果
+        if rank == 0:
+            
+            new = np.zeros_like(gathered_img)  # 创建一个空数组用于存储汇总结果
+            for i in range(size):
+                start = i * (self.shape[0] // size)
+                end = (i + 1) * (self.shape[0] // size) if i != size - 1 else self.shape[0]  # 每个进程处理的结束索引
+                new[start:end, :, :, :] = gathered_img[start:end, :, :, :]  
+
+            self.save_img(new, name)
+            print("重采样完成,请关闭图片\nreslicing complete")
+
         return new
 
     def estimate(self):
@@ -248,29 +278,32 @@ class Realign:
         估计刚体变换参数\n
         Estimate the rigid-body transform parameter\n
         output: 刚体变换参数(Rigid-body transform parameter)'''
-        print("开始估计刚体变换参数\nestimating")
-        q=np.zeros(7)
-        q[0] = 1
-        for picture in range(1, self.shape[0]):
-            # 高斯牛顿迭代
-            q=q / self.beta
-            for _ in range(self.iteration):
-                
-                q[0]=1
-                (b, diff_b) = self.iterate(self.img_data[0,:, :, :],self.img_data[picture,:,:,:], q,picture)
-                
-                if np.linalg.det(diff_b.T@diff_b) == 0:
-                    # 矩阵不可逆时用伪逆
-                    q -= self.alpha * np.linalg.pinv(diff_b.T@diff_b)@diff_b.T@b
-                else:
-                    q -= self.alpha * np.linalg.inv(diff_b.T@diff_b)@diff_b.T@b
+        
+        if rank == 0:
+            print("开始估计刚体变换参数\nestimating")
+            q=np.zeros(7)
             q[0] = 1
-            q[q>40]=0
-            q[q<-40]=0
-            self.parameter[picture] = q/10
-            print(f"进度{picture*100/self.shape[0]}%", end="\r")
-        print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
-        self.draw_parameter()
+            for picture in range(1, self.shape[0]):
+                # 高斯牛顿迭代
+                q=q / self.beta
+                for _ in range(self.iteration):
+                    
+                    q[0]=1
+                    (b, diff_b) = self.iterate(self.img_data[0,:, :, :],self.img_data[picture,:,:,:], q,picture)
+                    
+                    if np.linalg.det(diff_b.T@diff_b) == 0:
+                        # 矩阵不可逆时用伪逆
+                        q -= self.alpha * np.linalg.pinv(diff_b.T@diff_b)@diff_b.T@b
+                    else:
+                        q -= self.alpha * np.linalg.inv(diff_b.T@diff_b)@diff_b.T@b
+                q[0] = 1
+                q[q>40]=0
+                q[q<-40]=0
+                self.parameter[picture] = q/10
+                print(f"进度{picture*100/self.shape[0]}%", end="\r")
+            print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
+            self.draw_parameter()
+        self.parameter = comm.bcast(self.parameter, root=0)  # 广播参数到所有进程
         return self.parameter
 
     def save_img(self,img, name):
@@ -307,57 +340,16 @@ class Realign:
         ax2.set_ylabel('degrees')
         ax2.legend()
         fig.tight_layout()
-        plt.show()
+        plt.savefig("parameter.png")
         
-        
-class TorchRealign (torch.autograd.Function,Realign):
-    def __init__(self,path):
-        Realign.__init__(self,path)
-
-#把对准图像改成了第一张
-    @staticmethod
-    def forward(q,ctx,picture):#ctx = self
-        b, b_diff = ctx.iterate(ctx.img_data[0, :, :, :], ctx.img_data[picture, :, :, :], q, picture)
-        #b_diff.save_for_backward(torch.from_numpy(q))
-        return b,b_diff
-    
-    @staticmethod# arges = diff_b
-    def backward(alpha, b, b_diff):
-        q = torch.zeros(7)
-        q[6] = 1
-        
-        if np.linalg.det(b_diff.T @ b_diff) == 0:
-            # 矩阵不可逆时用伪逆
-            q -= alpha * torch.from_numpy(np.linalg.pinv(b_diff.T @ b_diff) @ b_diff.T @ b)
-        else:
-            q -= alpha * torch.from_numpy(np.linalg.inv(b_diff.T @ b_diff) @ b_diff.T @ b)
-
-        return q
-
-    def TorchOptimize(self, LEARNINGTIMES):
-        print("开始估计刚体变换参数(Torch 版...)..")
-        q = torch.zeros(7)
-        q[0] = 1
-        
-        for picture in range(1, self.shape[0]):
-            q = q / self.beta
-
-            for _ in range(LEARNINGTIMES):
-                b, diff_b = self.forward(q, self, picture)
-                q = self.backward(self.alpha, b, diff_b)
-                q[0] = 1
-                q[q>50]=0
-                q[q<-50]=0
-                
-                self.parameter[picture] = q.numpy() / 10
-                print(f"进度{picture * 100 / self.shape[0]}%", end="\r")
-
-        return self.parameter
 
 if __name__ == "__main__":
+    import time
+    
+    start = time.perf_counter()
+    
     ## 测验代码
-    #  realign = Realign('sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz')
-    realign = Realign('C:\\Users\\26698\\BME_SHT\\data\\sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz')
+    realign = Realign('./data/sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz')
 
     realign.set_step(2)
     realign.set_iteration(2)
@@ -368,11 +360,12 @@ if __name__ == "__main__":
     realign.set_beta(1.65)
     
     # 获得刚体变换参数并绘制头动曲线
-#    realign.estimate()
+    # if rank == 0:
+    realign.estimate()
     # 获得重采样后的图像
-#    realign.reslicing("picture")
+    realign.reslicing("picture")
+    
+    MPI.Finalize()
 
-
-    torchrealign = TorchRealign("C:\\Users\\26698\\BME_SHT\\data\\sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii")
-    torchrealign.TorchOptimize(1)
-    torchrealign.draw_parameter()
+    end = time.perf_counter()
+    print(f"总耗时{end-start}秒")
