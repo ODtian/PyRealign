@@ -4,7 +4,7 @@ import itk
 import nibabel as nib
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
-
+import time
 from mpi4py import MPI
 
 # MPI初始化
@@ -153,14 +153,15 @@ class Realign:
         new_img:新图像(new image)'''
         new_img = np.ndarray(resource.shape)
         # 对应位置的转换
+        M = self.rigid(q)
+        if np.linalg.det(M) <= 1e-10:  # 判断矩阵是否可逆
+            invM = np.linalg.pinv(M)  # 矩阵不可逆时用伪逆
+        else:
+            invM = np.linalg.inv(M)
         for i in range(self.shape[1]):
             for j in range(self.shape[2]):
                 for k in range(self.shape[3]):
-                    M = self.rigid(q)
-                    if np.linalg.det(M)==0:
-                        interpo_pos = np.linalg.pinv(M)@[i, j, k, 1]
-                    else:
-                        interpo_pos =np.linalg.inv(M)@[i, j, k, 1]
+                    interpo_pos = invM@[i, j, k, 1]
                     if 0 <= interpo_pos[0] < self.shape[1] and 0 <= interpo_pos[1] < self.shape[2] and 0 <= interpo_pos[2] < self.shape[3]:  # 判断是否在范围内
                         new_img[i, j, k] = resource[int(interpo_pos[0]), int(interpo_pos[1]), int(interpo_pos[2])]
                     else:
@@ -194,7 +195,7 @@ class Realign:
                     n_k = k*step
                     M = self.rigid(q)
                     M[3,3]=0.0
-                    if np.linalg.det(M)==0:
+                    if np.linalg.det(M) <= 1e-10:  # 判断矩阵是否可逆
                         interpo_pos = np.linalg.pinv(M)@[n_i, n_j, n_k, 1]
                     else:
                         interpo_pos =np.linalg.inv(M)@[n_i, n_j, n_k, 1]
@@ -257,7 +258,7 @@ class Realign:
             print(f"rank {rank}: 进度{(picture - start)*100/seperate_img.shape[0]}%")
         # 汇总所有进程处理的结果
         gathered_img = np.zeros_like(self.img_data_gauss)  # 创建一个空数组用于存储汇总结果
-        comm.Gather(seperate_img, gathered_img, root=0)  # 将每个进程处理的结果汇总到主进程
+        comm.Gatherv(seperate_img, gathered_img, root=0)  # 将每个进程处理的结果汇总到主进程
         
         # 主进程保存结果
         if rank == 0:
@@ -291,7 +292,7 @@ class Realign:
                     q[0]=1
                     (b, diff_b) = self.iterate(self.img_data[0,:, :, :],self.img_data[picture,:,:,:], q,picture)
                     
-                    if np.linalg.det(diff_b.T@diff_b) == 0:
+                    if np.linalg.det(diff_b.T@diff_b) <= 1e-10:  # 判断矩阵是否可逆
                         # 矩阵不可逆时用伪逆
                         q -= self.alpha * np.linalg.pinv(diff_b.T@diff_b)@diff_b.T@b
                     else:
@@ -303,7 +304,13 @@ class Realign:
                 print(f"进度{picture*100/self.shape[0]}%", end="\r")
             print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
             self.draw_parameter()
+            
         self.parameter = comm.bcast(self.parameter, root=0)  # 广播参数到所有进程
+        
+        # request = comm.Ibcast(self.parameter, root=0)  # 异步广播参数到所有进程
+        
+        # while not request.Test():
+        #     time.sleep(0.1)  # 等待广播完成
         return self.parameter
 
     def save_img(self,img, name):
@@ -343,9 +350,7 @@ class Realign:
         plt.savefig("parameter.png")
         
 
-if __name__ == "__main__":
-    import time
-    
+if __name__ == "__main__":    
     start = time.perf_counter()
     
     ## 测验代码
