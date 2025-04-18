@@ -6,11 +6,33 @@ import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
 import time
 from mpi4py import MPI
+import cProfile
+from numba import njit, prange
+
+profiler = cProfile.Profile()
+
+PROFILE = False  # 是否开启性能分析
 
 # MPI初始化
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()  # 获取当前进程的rank
 size = comm.Get_size()  # 获取总进程数
+
+
+@njit(parallel=True)
+def fast_get_new_img(resource, invM, shape1, shape2, shape3):
+    new_img = np.empty((shape1, shape2, shape3), dtype=resource.dtype)
+    for i in prange(shape1):
+        for j in range(shape2):
+            for k in range(shape3):
+                pos = invM @ np.array([i, j, k, 1.0])
+                x, y, z = pos[0], pos[1], pos[2]
+                if 0 <= x < shape1 and 0 <= y < shape2 and 0 <= z < shape3:
+                    new_img[i, j, k] = resource[int(x), int(y), int(z)]
+                else:
+                    new_img[i, j, k] = resource[i, j, k]
+    return new_img
+
 
 class Realign:
     def __init__(self, path, sigma=1, iteration=1, order=1, step = 2, alpha = 1, beta = 1.2):
@@ -143,30 +165,20 @@ class Realign:
         coor = self.v2d()
         return np.linalg.inv(coor) @ M_r @ coor
 
-    def get_new_img(self, resource, q,pic_num):
-        '''
-        获取新图像(get new image)\n
-        输入参数(parameter):\n
-        resource:原始图像(raw image)\n
-        q:旋转平移参数(rotation and translation parameters)\n
-        输出(output):\n
-        new_img:新图像(new image)'''
-        new_img = np.ndarray(resource.shape)
-        # 对应位置的转换
+    def get_new_img(self, resource, q, pic_num):
         M = self.rigid(q)
-        if np.linalg.det(M) <= 1e-10:  # 判断矩阵是否可逆
-            invM = np.linalg.pinv(M)  # 矩阵不可逆时用伪逆
+        if np.linalg.det(M) <= 1e-10:
+            invM = np.linalg.pinv(M)
         else:
             invM = np.linalg.inv(M)
-        for i in range(self.shape[1]):
-            for j in range(self.shape[2]):
-                for k in range(self.shape[3]):
-                    interpo_pos = invM@[i, j, k, 1]
-                    if 0 <= interpo_pos[0] < self.shape[1] and 0 <= interpo_pos[1] < self.shape[2] and 0 <= interpo_pos[2] < self.shape[3]:  # 判断是否在范围内
-                        new_img[i, j, k] = resource[int(interpo_pos[0]), int(interpo_pos[1]), int(interpo_pos[2])]
-                    else:
-                        new_img[i, j, k] = resource[i, j, k]
-        return new_img
+        shape1, shape2, shape3 = resource.shape
+        return fast_get_new_img(resource, invM, shape1, shape2, shape3)
+
+    def use_inter_evaluate(self, point, interpolator, reference, n_i, n_j, n_k):
+        return (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
+        
+    def use_inter_evaluate_derivative(self, point, interpolator):
+        return interpolator.EvaluateDerivative(point)
 
     def iterate(self, reference,resource, q,pic_num):
         '''
@@ -186,12 +198,18 @@ class Realign:
 
         
         total = self.x * self.y * self.z
+        unit = total // size  # 每个进程处理的图像数量
+        remain = total % size  # 剩余的图像数量
         
-        start = rank * (total // size)  # 每个进程处理的起始索引
-        end = (rank + 1) * (total // size) if rank != size - 1 else total  # 每个进程处理的结束索引
+        if rank == 0:
+            start = 0
+        else:
+            start = rank * unit + remain
+        
+        end = (rank + 1) * unit + remain
         
         bi = np.zeros(end - start)  # 残差 (residual)   
-        b_diff = np.zeros(((end - start), 7))  # 偏导矩阵 (derivative matrix)
+        b_diff = np.zeros((end - start, 7))  # 偏导矩阵 (derivative matrix)
 
         # 处理每个进程分配的图像
         for index in range(start, end):
@@ -199,9 +217,10 @@ class Realign:
             j = (index // self.z) % self.y
             k = index % self.z
             
-            n_i = i*step  # 对应位置的转换,获得点在原图的位置(get the position of the point in the original image)
-            n_j = j*step
-            n_k = k*step
+            n_i = int(i*step * self.affine[1, 1]) if int(i*step * self.affine[1, 1]) else self.shape[1] - 1
+            n_j = int(j*step * self.affine[2, 2]) if int(j*step * self.affine[2, 2]) else self.shape[2] - 1
+            n_k = int(k*step * self.affine[3, 3]) if int(k*step * self.affine[3, 3]) else self.shape[3] - 1
+            # print(self.shape, (self.x, self.y, self.z), (n_i, n_j, n_k))
             M = self.rigid(q)
             M[3,3]=0.0
             if np.linalg.det(M) <= 1e-10:
@@ -219,9 +238,11 @@ class Realign:
                 point[2] = n_j
                 point[3] = n_k
                 point[0] = pic_num
-            bi[index - start] = (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
+            # bi[index - start] = (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
+            bi[index - start] = self.use_inter_evaluate(point, interpolator, reference, n_i, n_j, n_k)
             tem=interpolator.Evaluate(point)-reference[n_i][n_j][n_k]
-            derivative = interpolator.EvaluateDerivative(point)
+            # derivative = interpolator.EvaluateDerivative(point)
+            derivative = self.use_inter_evaluate_derivative(point, interpolator)
             diff_x = derivative[1]
             diff_y = derivative[2]
             diff_z = derivative[3]
@@ -239,13 +260,20 @@ class Realign:
                 diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2]))*tem
             b_diff[index - start][0] = 1
             
+            # print('tem:',tem)
+            # break
+            
         # 汇总所有进程处理的结果
-        gathered_bi = np.zeros(total)  # 创建一个空数组用于存储汇总结果
-        gathered_b_diff = np.zeros((total, 7))  # 创建一个空数组用于存储汇总结果
+        gathered_bi = np.zeros(unit * size)  # 创建一个空数组用于存储汇总结果
+        gathered_b_diff = np.zeros((unit * size, 7))  # 创建一个空数组用于存储汇总结果
         
-        comm.Gatherv(bi, gathered_bi, root=0)  # 将每个进程处理的结果汇总到主进程
-        comm.Gatherv(b_diff, gathered_b_diff, root=0)  # 将每个进程处理的结果汇总到主进程
-        return bi, b_diff
+        if rank == 0:
+            comm.Gather(bi[remain:], gathered_bi, root=0)  # 将每个进程处理的结果汇总到主进程
+            comm.Gather(b_diff[remain:], gathered_b_diff, root=0)  # 将每个进程处理的结果汇总到主进程
+        else:                
+            comm.Gather(bi, gathered_bi, root=0)  # 将每个进程处理的结果汇总到主进程
+            comm.Gather(b_diff, gathered_b_diff, root=0)  # 将每个进程处理的结果汇总到主进程
+        return gathered_bi, gathered_b_diff
 
     def reslicing(self,name):
         '''
@@ -258,27 +286,31 @@ class Realign:
         print("开始重采样对齐(注意，需要很长时间，建议先去干点别的事)\nreslicing")
         new = np.ndarray(self.shape)
         
-        start = rank * (self.shape[0] // size)  # 每个进程处理的起始索引
-        end = (rank + 1) * (self.shape[0] // size) if rank != size - 1 else self.shape[0]  # 每个进程处理的结束索引
+        unit = self.shape[0] // size  # 每个进程处理的图像数量
+        remain = self.shape[0] % size  # 剩余的图像数量
+        
+        if rank == 0:
+            start = 0
+        else:
+            start = rank * unit + remain
+        end = (rank + 1) * unit + remain  # 每个进程处理的结束索引
+        
         # 处理每个进程分配的图像
-        seperate_img = self.img_data_gauss[start:end, :, :, :].copy()
+        seperate_img = np.empty(shape=(end - start,) + self.img_data_gauss.shape[1:])  # 创建一个空数组用于存储每个进程处理的结果
         for picture in range(start, end):
             seperate_img[picture-start,:, :, :] = self.get_new_img(self.img_data_gauss[picture,:, :, :], self.parameter[picture],picture)
-            print(f"rank {rank}: 进度{(picture - start)*100/seperate_img.shape[0]}%")
+            # print(f"rank {rank}: 进度{(picture - start)*100/seperate_img.shape[0]}%")
         # 汇总所有进程处理的结果
-        gathered_img = np.zeros_like(self.img_data_gauss)  # 创建一个空数组用于存储汇总结果
-        comm.Gatherv(seperate_img, gathered_img, root=0)  # 将每个进程处理的结果汇总到主进程
+        gathered_img = np.empty((unit * size, ) + tuple(self.shape[1:]))  # 创建一个空数组用于存储汇总结果
+        
+        if rank == 0:
+            comm.Gather(seperate_img[remain:], gathered_img, root=0)
+        else:
+            comm.Gather(seperate_img, gathered_img, root=0)  # 将每个进程处理的结果汇总到主进程
         
         # 主进程保存结果
         if rank == 0:
-            
-            new = np.zeros_like(gathered_img)  # 创建一个空数组用于存储汇总结果
-            for i in range(size):
-                start = i * (self.shape[0] // size)
-                end = (i + 1) * (self.shape[0] // size) if i != size - 1 else self.shape[0]  # 每个进程处理的结束索引
-                new[start:end, :, :, :] = gathered_img[start:end, :, :, :]  
-
-            self.save_img(new, name)
+            # self.save_img(gathered_img, name)
             print("重采样完成,请关闭图片\nreslicing complete")
 
         return new
@@ -359,7 +391,20 @@ class Realign:
         
 
 if __name__ == "__main__":    
+    # 设置numba线程数（如需自定义线程数，设置环境变量NUMBA_NUM_THREADS）
+    # 例如: os.environ["NUMBA_NUM_THREADS"] = "4" 需在import numba前设置
+    import os
+    os.environ["NUMBA_NUM_THREADS"] = "5"  # 可取消注释并设置线程数
+    # print("Numba线程数:", config.NUMBA_DEFAULT_NUM_THREADS)  # 查看当前线程数
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+
     start = time.perf_counter()
+    
+    if rank == 0 and PROFILE:
+        profiler.enable()
+
     
     ## 测验代码
     realign = Realign('./data/sub-Ey153_ses-3_task-rest_acq-EPI_run-2_bold.nii.gz')
@@ -380,5 +425,11 @@ if __name__ == "__main__":
     
     MPI.Finalize()
 
+    if rank == 0 and PROFILE:
+        profiler.disable()
+        profiler.dump_stats("profile.prof")
+    
     end = time.perf_counter()
-    print(f"总耗时{end-start}秒")
+    
+    if rank == 0:
+        print(f"总耗时{end-start}秒")
