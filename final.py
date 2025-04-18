@@ -43,11 +43,12 @@ class Realign:
         # 读取数据(load data)
         self.path = path
         self.img = itk.imread(path)
-        if rank == 0:
-            self.img_data = itk.GetArrayFromImage(self.img)
-        else:
-            self.img_data = None
-        self.img_data = comm.bcast(self.img_data)
+        self.img_data = itk.GetArrayFromImage(self.img)
+        # if rank == 0:
+            # self.img_data = itk.GetArrayFromImage(self.img)
+        # else:
+        #     self.img_data = None
+        # self.img_data = comm.bcast(self.img_data)
         # 记录数据信息(record data information)
         self.shape = self.img_data.shape
         spacing = self.img.GetSpacing()  # 体素间距(voxel spacing)
@@ -69,7 +70,7 @@ class Realign:
         self.alpha = alpha # 迭代过程的收敛系数 
         self.beta = beta # 每张图的初始缩小系数 
         
-        print("图片载入成功,请耐心等待:) \nimage loaded successfully,please wait patiently")
+        # print("图片载入成功,请耐心等待:) \nimage loaded successfully,please wait patiently")
     
     def set_gussian(self, sigma):
         '''
@@ -175,7 +176,8 @@ class Realign:
         return fast_get_new_img(resource, invM, shape1, shape2, shape3)
 
     def use_inter_evaluate(self, point, interpolator, reference, n_i, n_j, n_k):
-        return (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
+        # return (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])
+        return interpolator.Evaluate(point)-reference[n_i][n_j][n_k]
         
     def use_inter_evaluate_derivative(self, point, interpolator):
         return interpolator.EvaluateDerivative(point)
@@ -211,6 +213,13 @@ class Realign:
         bi = np.zeros(end - start)  # 残差 (residual)   
         b_diff = np.zeros((end - start, 7))  # 偏导矩阵 (derivative matrix)
 
+        M = self.rigid(q)
+        M[3,3]=0.0
+        if np.linalg.det(M) <= 1e-10:
+            M = np.linalg.pinv(M)
+        else:
+            M = np.linalg.inv(M)
+            
         # 处理每个进程分配的图像
         for index in range(start, end):
             i = index // (self.y * self.z)
@@ -220,13 +229,9 @@ class Realign:
             n_i = int(i*step * self.affine[1, 1]) if int(i*step * self.affine[1, 1]) else self.shape[1] - 1
             n_j = int(j*step * self.affine[2, 2]) if int(j*step * self.affine[2, 2]) else self.shape[2] - 1
             n_k = int(k*step * self.affine[3, 3]) if int(k*step * self.affine[3, 3]) else self.shape[3] - 1
-            # print(self.shape, (self.x, self.y, self.z), (n_i, n_j, n_k))
-            M = self.rigid(q)
-            M[3,3]=0.0
-            if np.linalg.det(M) <= 1e-10:
-                interpo_pos = np.linalg.pinv(M)@[n_i, n_j, n_k, 1]
-            else:
-                interpo_pos =np.linalg.inv(M)@[n_i, n_j, n_k, 1]
+
+            interpo_pos = M @ [n_i, n_j, n_k, 1]  # 变换后的坐标(transformed coordinate)
+
             point = itk.Point[itk.D, 4]()
             if 0 <= interpo_pos[0] < self.shape[1] and 0 <= interpo_pos[1] < self.shape[2] and 0 <= interpo_pos[2] < self.shape[3]:  # 判断是否在范围内
                 point[0] = pic_num
@@ -240,24 +245,25 @@ class Realign:
                 point[0] = pic_num
             # bi[index - start] = (interpolator.Evaluate(point)-reference[n_i][n_j][n_k])**2
             bi[index - start] = self.use_inter_evaluate(point, interpolator, reference, n_i, n_j, n_k)
-            tem=interpolator.Evaluate(point)-reference[n_i][n_j][n_k]
+            # tem=interpolator.Evaluate(point)-reference[n_i][n_j][n_k]
             # derivative = interpolator.EvaluateDerivative(point)
             derivative = self.use_inter_evaluate_derivative(point, interpolator)
             diff_x = derivative[1]
             diff_y = derivative[2]
             diff_z = derivative[3]
             (a,b,c)=self.shape[1:]
-            b_diff[index - start][1:4] = diff_x*tem, diff_y*tem, diff_z*tem
+            b_diff[index - start][1:4] = diff_x, diff_y, diff_z
+            # b_diff[index - start][1:4] = derivative[1:4]
             b_diff[index - start][4] = (diff_y*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[1][1] + self.affine[0][0]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[1][1] - 0.5*b*(-sin(q[4])*cos(q[6]) - sin(q[5])*sin(q[6])*cos(q[4])) - sin(q[4])*cos(q[6]) - sin(q[5])*sin(q[6])*cos(q[4]) - 0.5*self.affine[2][2]*c*cos(q[4])*cos(q[5])/self.affine[1][1] + self.affine[2][2]*cos(q[4])*cos(q[5])/self.affine[1][1]) + \
                 diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[5])*cos(q[6]) + sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*sin(q[5])*cos(q[6]) + sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(
-                    sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + 0.5*c*sin(q[4])*cos(q[5]) - sin(q[4])*cos(q[5])))*tem
+                    sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[2][2] + 0.5*c*sin(q[4])*cos(q[5]) - sin(q[4])*cos(q[5]))) #*tem
             b_diff[index - start][5] = (diff_x*(0.5*a*sin(q[5])*cos(q[6]) - sin(q[5])*cos(q[6]) + 0.5*self.affine[1][1]*b*sin(q[5])*sin(q[6])/self.affine[0][0] - self.affine[1][1]*sin(q[5])*sin(q[6])/self.affine[0][0] - 0.5*self.affine[2][2]*c*cos(q[5])/self.affine[0][0] + self.affine[2][2]*cos(q[5])/self.affine[0][0]) +\
                 diff_y*(0.5*self.affine[0][0]*a*sin(q[4])*cos(q[5])*cos(q[6])/self.affine[1][1] - self.affine[0][0]*sin(q[4])*cos(q[5])*cos(q[6])/self.affine[1][1] + 0.5*b*sin(q[4])*sin(q[6])*cos(q[5]) - sin(q[4])*sin(q[6])*cos(q[5]) + 0.5*self.affine[2][2]*c*sin(q[4])*sin(q[5])/self.affine[1][1] - self.affine[2][2]*sin(q[4])*sin(q[5])/self.affine[1][1]) +\
                 diff_z*(0.5*self.affine[0][0]*a*cos(q[4])*cos(q[5])*cos(q[6])/self.affine[2][2] - self.affine[0][0]*cos(q[4])*cos(q[5])*cos(q[6])/self.affine[2][2] + 0.5*self.affine[1][1]*b*sin(
-                    q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] - self.affine[1][1]*sin(q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] + 0.5*c*sin(q[5])*cos(q[4]) - sin(q[5])*cos(q[4])))*tem
+                    q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] - self.affine[1][1]*sin(q[6])*cos(q[4])*cos(q[5])/self.affine[2][2] + 0.5*c*sin(q[5])*cos(q[4]) - sin(q[5])*cos(q[4])))#*tem
             b_diff[index - start][6] = (diff_x*(0.5*a*sin(q[6])*cos(q[5]) - sin(q[6])*cos(q[5]) - 0.5*self.affine[1][1]*b*cos(q[5])*cos(q[6])/self.affine[0][0] + self.affine[1][1]*cos(q[5])*cos(q[6])/self.affine[0][0]) +\
                 diff_y*(-0.5*self.affine[0][0]*a*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[1][1] + self.affine[0][0]*(sin(q[4])*sin(q[5])*sin(q[6]) - cos(q[4])*cos(q[6]))/self.affine[1][1] - 0.5*b*(-sin(q[4])*sin(q[5])*cos(q[6]) - sin(q[6])*cos(q[4])) - sin(q[4])*sin(q[5])*cos(q[6]) - sin(q[6])*cos(q[4])) +\
-                diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2]))*tem
+                diff_z*(-0.5*self.affine[0][0]*a*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] + self.affine[0][0]*(sin(q[4])*cos(q[6]) + sin(q[5])*sin(q[6])*cos(q[4]))/self.affine[2][2] - 0.5*self.affine[1][1]*b*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2] + self.affine[1][1]*(sin(q[4])*sin(q[6]) - sin(q[5])*cos(q[4])*cos(q[6]))/self.affine[2][2]))#*tem
             b_diff[index - start][0] = 1
             
             # print('tem:',tem)
@@ -283,7 +289,7 @@ class Realign:
         '''
         self.interpolator = itk.BSplineInterpolateImageFunction.New(self.img_gauss)  # B样条插值器(B-spline interpolation)
         
-        print("开始重采样对齐(注意，需要很长时间，建议先去干点别的事)\nreslicing")
+        # print("开始重采样对齐(注意，需要很长时间，建议先去干点别的事)\nreslicing")
         new = np.ndarray(self.shape)
         
         unit = self.shape[0] // size  # 每个进程处理的图像数量
@@ -310,7 +316,7 @@ class Realign:
         
         # 主进程保存结果
         if rank == 0:
-            # self.save_img(gathered_img, name)
+            self.save_img(gathered_img, name)
             print("重采样完成,请关闭图片\nreslicing complete")
 
         return new
@@ -321,7 +327,7 @@ class Realign:
         Estimate the rigid-body transform parameter\n
         output: 刚体变换参数(Rigid-body transform parameter)'''
         
-        print("开始估计刚体变换参数\nestimating")
+        # print("开始估计刚体变换参数\nestimating")
         q=np.zeros(7)
         q[0] = 1
         for picture in range(1, self.shape[0]):
@@ -336,17 +342,18 @@ class Realign:
                 (b, diff_b) = self.iterate(self.img_data[0,:, :, :],self.img_data[picture,:,:,:], q,picture)
                 
                 if rank == 0:
-                    if np.linalg.det(diff_b.T@diff_b) <= 1e-10:  # 判断矩阵是否可逆
+                    tmp =diff_b.T@diff_b
+                    if np.linalg.det(tmp) <= 1e-10:  # 判断矩阵是否可逆
                         # 矩阵不可逆时用伪逆
-                        q -= self.alpha * np.linalg.pinv(diff_b.T@diff_b)@diff_b.T@b
+                        q -= self.alpha * np.linalg.pinv(tmp)@diff_b.T@b
                     else:
-                        q -= self.alpha * np.linalg.inv(diff_b.T@diff_b)@diff_b.T@b
+                        q -= self.alpha * np.linalg.inv(tmp)@diff_b.T@b
             q[0] = 1
             q[q>40]=0
             q[q<-40]=0
             self.parameter[picture] = q/10
-            print(f"进度{picture*100/self.shape[0]}%", end="\r")
-        print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
+        #     print(f"进度{picture*100/self.shape[0]}%", end="\r")
+        # print("刚体变换参数估计完成,若需要进行reslicing，请先关闭图像\nestimation complete")
         
         if rank == 0:
             self.draw_parameter()
@@ -394,7 +401,7 @@ if __name__ == "__main__":
     # 设置numba线程数（如需自定义线程数，设置环境变量NUMBA_NUM_THREADS）
     # 例如: os.environ["NUMBA_NUM_THREADS"] = "4" 需在import numba前设置
     import os
-    os.environ["NUMBA_NUM_THREADS"] = "5"  # 可取消注释并设置线程数
+    os.environ["NUMBA_NUM_THREADS"] = "8"  # 可取消注释并设置线程数
     # print("Numba线程数:", config.NUMBA_DEFAULT_NUM_THREADS)  # 查看当前线程数
 
     profiler = cProfile.Profile()
@@ -432,4 +439,4 @@ if __name__ == "__main__":
     end = time.perf_counter()
     
     if rank == 0:
-        print(f"总耗时{end-start}秒")
+        print(f"总耗时{end-start}秒") 
