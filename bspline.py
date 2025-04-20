@@ -2,6 +2,8 @@ import time
 from typing import Literal
 import itk
 import jax
+import jax.experimental
+import jax.experimental.pjit
 import jax.numpy as jnp
 import jax.scipy as jsp
 from functools import partial
@@ -11,7 +13,7 @@ import dataclasses
 import jax.scipy.spatial
 import jax.scipy.spatial.transform
 from matplotlib import pyplot as plt
-
+import nibabel as nib
 
 # JAX 默认使用 32 位浮点数，如果需要 64 位，可以取消注释下一行
 # from jax import config
@@ -165,8 +167,7 @@ class BSpline:
 
         self.block_shape = (self.degree + 1,) * self.dim + (self.data.shape[-1],)
         self.basis_shapes = tuple(
-            (1,) * (self.order - i - 1) + (self.order,) + (1,) * (i + 1)
-            for i in range(self.order)
+            (1,) * i + (self.order,) + (1,) * (self.dim - i) for i in range(self.dim)
         )
 
     def tree_flatten(self):
@@ -239,17 +240,22 @@ class BSpline:
             for xi, knots in zip(x, knots)
         )
         result = jax.lax.dynamic_slice(data, jnp.r_[spans, 0], block_shape)
-
+        # print(result)
         for xi, span, knots, shape in zip(x, spans, knots, basis_shapes):
             valid_knots = jax.lax.dynamic_slice(knots, (span,), (2 * degree + 2,))
             # print(f"{valid_knots=}")
             # print(f"{b.reshape(shape[:-1])}")
-            result *= B(xi, valid_knots, degree).reshape(shape)
+            r = B(xi, valid_knots, degree).reshape(shape)
+
+            # print(r)
+            result *= r
+            # print(f"{result=}")
 
             # print(f"{result=}")
         return result.sum()
 
 
+@jax.tree_util.register_pytree_node_class
 class Realign:
     def __init__(self, path, sigma=1, iteration=1, degree=2, step=2, alpha=1, beta=1.2):
         """初始化(initialization)\n
@@ -257,7 +263,7 @@ class Realign:
         path:文件路径(file path)
         """
         # 读取数据(load data)
-        self.path = path
+        # self.path = path
         data = itk.imread(path)
         self.ims = jnp.array(itk.GetArrayFromImage(data))
 
@@ -270,9 +276,8 @@ class Realign:
         # 默认参数设置及预处理(default parameter setting and preprocessing)
         self.iteration = iteration  # 迭代次数(iteration times)
         self.data_shape = self.ims.shape[1:]
-        self.ref_interpolator = BSpline(
-            self.ims[0].reshape((*self.data_shape, 1)), degree, mode="reflect"
-        )
+
+        self.ref_interpolator = BSpline(self.ims[0][..., None], degree, mode="reflect")
 
         self.v2d = self.voxel_to_descartes()
         self.inv_v2d = jnp.linalg.inv(self.v2d)
@@ -294,22 +299,9 @@ class Realign:
             )
         )
         self.sample_coords = jnp.stack(
-            (
-                *grids,
-                jnp.ones(grids[0].shape, dtype=jnp.float32),
-            ),
-            axis=-1,
-        ).reshape(-1, self.ims.ndim)
+            (*grids, jnp.ones(grids[0].shape)), axis=-1
+        ).reshape((-1, self.ims.ndim))
 
-        print(
-            jnp.stack(
-                (
-                    *grids,
-                    jnp.ones(grids[0].shape, dtype=jnp.float32),
-                ),
-                axis=-1,
-            )[1, 2, 3]
-        )
         # self.x, self.y, self.z = (
         #     int(self.shape[1] / self.affine[1, 1] // self.step),
         #     int(self.shape[2] / self.affine[2, 2] // self.step),
@@ -326,27 +318,18 @@ class Realign:
         # )
 
     def gaussian(self):
-        x = jnp.linspace(-3, 3, 7)
+        x = jnp.stack(jnp.indices((3, 3, 3, 3)), axis=-1)
+        # x = jnp.linspace(-3, 3, 7)
         pdf = jsp.stats.norm.pdf(x)
-        window = pdf * pdf[:, None] * pdf[:, :, None]
+        jsp.signal.correlate()
+        # window = pdf * pdf[:, None] * pdf[:, :, None]
         # jnp.meshg
         # smooth_image = jsp.signal.convolve(self., window, mode='same')
 
-    def iterate(self, q: jnp.ndarray, data_index):
-        """
-        高斯牛顿迭代(gauss-newton iterate)\n
-        输入参数(parameter):\n
-        resource:原始图像(raw image)\n
-        reference:参考图像(reference image)\n
-        q:旋转平移参数(rotation and translation parameters)\n
-        输出(output):\n
-        q:更新后的旋转平移参数(new rotation and translation parameters)\n
-        bi:残差(residual)\n
-        b_diff:偏导矩阵(derivative matrix)
-        """
-        print(self.sample_coords.shape)
+    @jax.jit
+    def iterate(self, q: jnp.ndarray, interpolator: BSpline):
 
-        @partial(jax.jit, static_argnames=["data", "ref", "sample_size"])
+        # @partial(jax.jit, static_argnames=["data", "ref", "sample_size"])
         @jax.value_and_grad
         def b_func(q, _, coord, data, ref, sample_size):
             transform = self.rigid(q)
@@ -365,51 +348,109 @@ class Realign:
             #     (transform_inv @ coord)[:-1], jnp.zeros(3), jnp.array(sample_size)
             # )
             transformed_coord = (transform_inv @ coord)[:-1]
+            return data(transformed_coord) - ref((coord)[:-1])
 
-            return data(transformed_coord) - q[0] * ref((coord)[:-1])
+        # def value_and_vjp(*args):
+        #     (b, d), f_vjp = jax.vjp(b_func, *args)
+        #     return (b, d), f_vjp((jnp.ones_like(b), jnp.zeros_like(d)))[0]
 
-        im = self.ims[data_index]
-        interpolator = BSpline(
-            im.reshape((*self.data_shape, 1)), self.degree, mode="reflect"
-        )
-        transform = self.rigid(q)
-        # .at[3, 3].set(0.0)
+        # im = self.ims[data_index]
+        # interpolator = BSpline(im[..., None], self.degree, mode="reflect")
+        # transform = self.rigid(q)
 
-        transform_inv = jnp.where(
-            jnp.linalg.det(transform) == 0,
-            jnp.linalg.pinv(transform),
-            jnp.linalg.inv(transform),
-        )
+        # transform_inv = jnp.where(
+        #     jnp.linalg.det(transform) == 0,
+        #     jnp.linalg.pinv(transform),
+        #     jnp.linalg.inv(transform),
+        # )
+
         value, grad = jax.vmap(b_func, in_axes=(None, None, 0, None, None, None))(
             q,
-            transform_inv,
+            0,
             self.sample_coords,
             interpolator,
             self.ref_interpolator,
             self.data_shape,
         )
+        return value, grad
+        # value, grad = jax.vmap(b_func, in_axes=(None, None, 0, None, None, None))(
+        #     q,
+        #     transform_inv,
+        #     self.sample_coords,
+        #     interpolator,
+        #     self.ref_interpolator,
+        #     self.data_shape,
+        # )
 
         # value, grad = b_func(q, transform, )
-        return value, grad
+        # return value, grad
 
+    def tree_flatten(self):
+        return (
+            # self.path,
+            self.ims,
+            self.affine,
+            self.data_shape,
+            self.ref_interpolator,
+            self.v2d,
+            self.inv_v2d,
+            self.step,
+            self.voxel_steps,
+            self.sample_coords,
+            self.alpha,  # 迭代过程的收敛系数
+            self.beta,  # 每张图的初始缩小系数
+        ), (
+            self.iteration,
+            self.degree,
+        )
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+        (
+            obj.ims,
+            obj.affine,
+            obj.data_shape,
+            obj.ref_interpolator,
+            obj.v2d,
+            obj.inv_v2d,
+            obj.step,
+            obj.voxel_steps,
+            obj.sample_coords,
+            obj.alpha,  # 迭代过程的收敛系数
+            obj.beta,  # 每张图的初始缩小系数
+        ) = children
+        (obj.iteration, obj.degree) = aux_data
+        return obj
+
+    @jax.jit
     def estimate(self, data_index):
         q = jnp.zeros(7).at[0].set(1.0)
 
+        im = self.ims[data_index]
+        interpolator = BSpline(im[..., None], self.degree, mode="reflect")
+
         for _ in range(self.iteration):
             # q /= self.beta
-            b, diff_b = self.iterate(q, data_index)
-            d = diff_b.T @ diff_b
-            m = (
-                self.alpha
-                * jnp.where(
-                    jnp.linalg.det(d) == 0,
-                    jnp.linalg.pinv(d),
-                    jnp.linalg.inv(d),
-                )
-                @ diff_b.T
-                @ b
+            b, diff_b = self.iterate(q, interpolator)
+            # print(b, diff_b)
+            # jsp
+            # jax.scipy.sparse.linalg.cg()
+            # r = diff_b.T @ diff_b
+            # m = (
+            #     # self.alpha
+            #     jnp.where(
+            #         jnp.linalg.det(r) == 0,
+            #         jnp.linalg.pinv(r),
+            #         jnp.linalg.inv(r),
+            #     )
+            #     @ diff_b.T
+            #     @ b
+            # )
+            m = jsp.linalg.solve(
+                diff_b.T @ diff_b, diff_b.T @ b, overwrite_a=True, overwrite_b=True
             )
-            q -= m
+            q -= self.alpha * m
             # plt.plot(jnp.arange(self.sample_coords.shape[0]), b, "r.")
             # plt.plot(jnp.arange(7), m, "r.")
             # plt.show()
@@ -418,7 +459,13 @@ class Realign:
         # q[0] = 1
         # q[q > 40] = 0
         # q[q < -40] = 0
-        return jnp.r_[q, b]
+        # coord = jnp.stack(jnp.indices(self.data_shape), axis=-1).reshape(
+        #     (-1, self.data)
+        # )
+        # return jnp.r_[q, m]
+        return q
+
+    # , jax.vmap(interpolator, in_axes=0)(jnp.)
 
     def voxel_to_descartes(self):
         """
@@ -522,65 +569,195 @@ class Realign:
         ax2.set_ylabel("degrees")
         ax2.legend()
 
-        ax3.set_title("error")
-        ax3.set_xlabel("image")
-        ax3.plot(x, parameter[:, 7], label="error", color="yellow")
-        ax3.legend()
+        # ax3.set_title("error")
+        # ax3.set_xlabel("image")
+        # ax3.plot(x, parameter[:, 7], label="error", color="yellow")
+        # ax3.plot(x, parameter[:, 8], label="error", color="yellow")
+        # ax3.plot(x, parameter[:, 9], label="error", color="yellow")
+        # ax3.plot(x, parameter[:, 10], label="error", color="yellow")
+        # ax3.plot(x, parameter[:, 11], label="error", color="yellow")
+        # ax3.plot(x, parameter[:, 12], label="error", color="yellow")
+        # ax3.plot(x, parameter[:, 13], label="error", color="yellow")
+        # ax3.legend()
         fig.tight_layout()
         plt.show()
 
 
 def main():
-
+    jax.config.update("jax_compilation_cache_dir", "./jax_cache")
     realign = Realign(
         r"data\sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz",
         # r"test.nii",
         degree=3,
-        iteration=4,
-        step=2,
+        iteration=2,
+        step=0.3,
         alpha=0.15,
         beta=1.65,
     )
+    # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
     t1 = time.time()
+    print(jax.devices())
+    # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     # v = realign.estimate(1).reshape((-1, 8))
-    v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 20))
+    # v = jax.pmap(realign.estimate, in_axes=0)(jnp.arange(1, 16))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
+    # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200)).block_until_ready()
+    # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200)).block_until_ready()
+    # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200)).block_until_ready()
+    # plt.imshow(d)
+    print(v.shape)
+    print(v)
+    # img = jnp.transpose(d, (3, 2, 1, 0))  # 将图片转换为nii格式就要按nii的顺序排列
+    # img = nib.Nifti1Image(img, realign.affine)
+    # img.to_filename("tested.nii.gz")
     # v = jax.vmap(realign.estimate, in_axes=0)(jnp.array((0, 0)))
     print(
-        v,
         f"{time.time() - t1:.4f}",
     )
     realign.draw_parameter(v)
 
 
+def show():
+    def flatten_voxels_to_image(voxel_data, grid_cols=None, background_value=0):
+        D, H, W = voxel_data.shape
+
+        # --- 计算网格维度 ---
+
+        grid_cols = int(jnp.ceil(jnp.sqrt(D)))
+
+        # 计算网格行数
+        grid_rows = int(jnp.ceil(D / grid_cols))
+
+        # --- 准备数据：填充以形成完整网格 ---
+        total_grid_cells = grid_rows * grid_cols
+        padding_needed = total_grid_cells - D
+
+        # 如果需要填充
+        if padding_needed > 0:
+            # 创建填充块
+            padding_shape = (padding_needed, H, W)
+            padding_block = jnp.full(
+                padding_shape, background_value, dtype=voxel_data.dtype
+            )
+            # 将填充块连接到原始数据后面 (沿着第一个轴)
+            padded_data = jnp.concatenate([voxel_data, padding_block], axis=0)
+        else:
+            padded_data = voxel_data  # 不需要填充
+
+        # --- 重新排列数据 ---
+        # 1. 将填充后的数据 reshape 成 (grid_rows, grid_cols, H, W)
+        #    这会将切片按网格结构分组
+        grid_view = padded_data.reshape(grid_rows, grid_cols, H, W)
+
+        # 2. 交换/转置轴的顺序，使得 H 和 W 维度相邻
+        #    目标形状: (grid_rows, H, grid_cols, W)
+        transposed_view = grid_view.transpose((0, 2, 1, 3))
+
+        # 3. 最后，将前两个维度 (grid_rows, H) 和后两个维度 (grid_cols, W) 合并
+        #    得到最终的 2D 图像形状: (grid_rows * H, grid_cols * W)
+        flattened_image = transposed_view.reshape(grid_rows * H, grid_cols * W)
+
+        return flattened_image
+
+    def read_data(path):
+        data = itk.imread(path)
+
+        return data, jnp.array(itk.GetArrayFromImage(data))
+
+    # with open("test.nii", "rb") as f:
+    #     data = f.read()
+    # print(data)
+    data, d = read_data(r"data\sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz")
+
+    fig2 = plt.figure(figsize=(10, 8))
+    # ax2 = fig2.add_subplot(111, projection="3d")
+    ax2 = fig2.add_subplot(111)
+    cmap = plt.get_cmap("coolwarm")
+    # 创建归一化器，将数据值映射到 [0, 1]
+    # norm = mcolors.Normalize(vmin=min_val, vmax=max_val)
+
+    # 将数据值通过归一化器和颜色映射转换为 RGBA 颜色
+    # cmap(norm(data)) 会返回一个 (Z, Y, X, 4) 的数组
+    r = flatten_voxels_to_image(d[0], 4)
+    # r = d[0, 12]
+    # facecolors = r / 1000
+    facecolors = cmap(
+        # (r - r.min())
+        # / (r.max() - r.min())
+        r.clip(-5000, 5000)
+        / 5000
+        # / 1000.0
+    )  # 这里假设 d 是一个 (Z, Y, X) 的数组
+    # facecolors = cmap(
+    #     (r - r.min()) / (r.max() - r.min())
+    #     # r
+    # )  # 这里假设 d 是一个 (Z, Y, X) 的数组
+
+    # 可选：设置透明度 (修改 alpha 通道)
+    # facecolors[:, :, :, -1] = 0.7  # 设置所有体素的 alpha 值
+
+    # r = d[0].reshape((-1,))
+    # 使用 voxels 绘制
+    # 第一个参数是一个布尔数组，指示哪些体素需要绘制，这里我们绘制所有
+    # facecolors 参数指定每个体素表面的颜色
+    # edgecolors 可以设置边框颜色
+    ax2.imshow(facecolors)
+    # voxels = ax2.voxels(
+    #     jnp.ones(r.shape, dtype=bool),
+    #     facecolors=facecolors,
+    #     edgecolors="k",
+    #     linewidth=0.2,
+    # )
+    # facecolors
+    plt.show()
+
+
 if __name__ == "__main__":
+    # m = jax.random.randint(jax.random.PRNGKey(120), (3, 3), 0, 10)
+    # bsp = BSpline(
+    #     m.reshape((*m.shape, 1)),
+    #     degree=1,
+    #     mode="reflect",
+    # )
+    # bsp(jnp.array((1, 1.5)))
+    # d.shape
     main()
-    # print(jnp.arange(20).reshape((4, 5)))
-    # line = BSpline(jnp.arange(20).reshape((4, 5, 1)), 2, pad_mode="edge", clamp=False)
-    # print(jnp.arange(20).reshape((20, 1)))
-    # p = jax.random.uniform(jax.random.PRNGKey(120), shape=(20, 1))
-    # print(p)
-    # print(p.shape)
-    # line = BSpline(p, 1, mode=None)
+    # show()
+# print(jnp.arange(20).reshape((4, 5)))
+# line = BSpline(jnp.arange(20).reshape((4, 5, 1)), 2, pad_mode="edge", clamp=False)
+# print(jnp.arange(20).reshape((20, 1)))
+# p = jax.random.uniform(jax.random.PRNGKey(120), shape=(20, 1))
+# print(p)
+# print(p.shape)
+# line = BSpline(p, 1, mode=None)
 
-    # # line = BSpline(jnp.arange(20).reshape((20, 1)), 1, pad_mode="edge", clamp=False)
-    # print(1)
-    # x = jnp.linspace(0, 19, 2400000).reshape(2400000, 1)
-    # # x = jnp.linspace(0.5, 18.5, 24000).reshape(24000, 1)
-    # # for i in range(2000):
-    # t1 = time.time()
-    # # line(jnp.array((0,)))
-    # y = jax.vmap(line, in_axes=0)(x).block_until_ready()
-    # t2 = time.time()
-    # # print(f"{i}: {t2 - t1:.4f}")
-    # ref = jnp.random.uniform(jax.random.PRNGKey(120), (20, 30, 60))
+# # line = BSpline(jnp.arange(20).reshape((20, 1)), 1, pad_mode="edge", clamp=False)
+# print(1)
+# x = jnp.linspace(0, 19, 2400000).reshape(2400000, 1)
+# # x = jnp.linspace(0.5, 18.5, 24000).reshape(24000, 1)
+# # for i in range(2000):
+# t1 = time.time()
+# # line(jnp.array((0,)))
+# y = jax.vmap(line, in_axes=0)(x).block_until_ready()
+# t2 = time.time()
+# # print(f"{i}: {t2 - t1:.4f}")
+# ref = jnp.random.uniform(jax.random.PRNGKey(120), (20, 30, 60))
 
-    # q = np.zeros(7)
-    # for i in range(2):
-    #     jax.grad(b_func())
-    # print(1)
-    # plt.plot(x, y)
-    # plt.scatter(jnp.arange(20), p)
-    # plt.show()
+# q = np.zeros(7)
+# for i in range(2):
+#     jax.grad(b_func())
+# print(1)
+# plt.plot(x, y)
+# plt.scatter(jnp.arange(20), p)
+# plt.show()
 
 # -<SYSTEM_CAPABILITY>
 # -* -You -are -utilising -an -Ubuntu -20.04 -virtual -machine -using -x86_64 -architecture.
