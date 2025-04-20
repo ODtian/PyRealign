@@ -390,8 +390,6 @@ class Realign:
             # self.path,
             self.ims,
             self.affine,
-            self.data_shape,
-            self.ref_interpolator,
             self.v2d,
             self.inv_v2d,
             self.step,
@@ -400,6 +398,8 @@ class Realign:
             self.alpha,  # 迭代过程的收敛系数
             self.beta,  # 每张图的初始缩小系数
         ), (
+            self.data_shape,
+            self.ref_interpolator,
             self.iteration,
             self.degree,
         )
@@ -410,8 +410,8 @@ class Realign:
         (
             obj.ims,
             obj.affine,
-            obj.data_shape,
-            obj.ref_interpolator,
+            # obj.data_shape,
+            # obj.ref_interpolator,
             obj.v2d,
             obj.inv_v2d,
             obj.step,
@@ -420,13 +420,19 @@ class Realign:
             obj.alpha,  # 迭代过程的收敛系数
             obj.beta,  # 每张图的初始缩小系数
         ) = children
-        (obj.iteration, obj.degree) = aux_data
+        (
+            obj.data_shape,
+            obj.ref_interpolator,
+            obj.iteration,
+            obj.degree,
+        ) = aux_data
         return obj
 
+    # @partial(jax.jit, static_argnames=["self"])
     @jax.jit
     def estimate(self, data_index):
         q = jnp.zeros(7).at[0].set(1.0)
-
+        print(data_index.shape)
         im = self.ims[data_index]
         interpolator = BSpline(im[..., None], self.degree, mode="reflect")
 
@@ -590,7 +596,7 @@ def main():
         # r"test.nii",
         degree=3,
         iteration=2,
-        step=0.3,
+        step=2,
         alpha=0.15,
         beta=1.65,
     )
@@ -599,7 +605,7 @@ def main():
     print(jax.devices())
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     # v = realign.estimate(1).reshape((-1, 8))
-    v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 20))
+    v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
     # v = jax.pmap(realign.estimate, in_axes=0)(jnp.arange(1, 16))
     # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
     # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
