@@ -52,8 +52,32 @@ This software implements a high-performance 3D B-spline interpolation framework 
     - The main() function runs registration for a batch of images using vmap;
     - The show() function provides 2D visualization for volumetric slices using matplotlib.
   
+#### 2.1.1 Prerequisites
+#### 2.1.2 Main pipeline
+#### 2.1.3 Output files
 
 ### 2.2 Software Functionalities
+
+Compared to the original final.py, which implements CPU-based rigid-body registration using nested Python for-loops and ITK's interpolation, our accelerated version bspline.py introduces the following key improvements and components:
+
+- Key Functional Modules:
+    - JAX-Based BSpline Interpolator:
+        - A custom BSpline class written with jax.jit and vectorized operations replaces ITK’s native interpolator, enabling GPU acceleration and full differentiability.
+    - Motion Parameter Estimation with Auto-Differentiation:
+        - The Realign.iterate and estimate functions now use jax.value_and_grad and jax.vmap to automatically compute Jacobians and apply Gauss-Newton updates efficiently.
+
+    - Coordinate System Transformation:
+        - voxel_to_descartes and rigid compute the transformation between voxel and world space, applying translation and rotation using matrix multiplication, compatible with JAX.
+
+    - Parallelized Batch Estimation:
+        - Through jax.vmap and optional jax.pmap, multiple volumes can be realigned in parallel, significantly speeding up motion correction for large 4D fMRI datasets.
+
+- Processing Flow:
+    - Data Loading: Read a 4D .nii.gz neuroimaging dataset using ITK and convert to JAX arrays.
+    - Reference Interpolation: Construct a BSpline object on the reference frame (usually the first volume).
+    - Iterative Registration: For each moving frame, estimate 6-DOF rigid-body motion using JAX-based Gauss-Newton iterations.
+    - Transformation Application: Apply the estimated transformation matrix to resample each volume if needed.
+    - Optional Visualization: Use Matplotlib to plot motion parameters (translation, rotation) over time.
 
 
 ## 3 Illustrative examples
@@ -64,6 +88,7 @@ The user loads a .nii.gz file using ITK. The software automatically extracts vox
 Step 2: Run Optimization
 
 Using Realign.estimate(index), rigid-body parameters for each volume are optimized iteratively via Gauss–Newton-like updates. JAX's autodiff and jit compilation significantly reduce runtime.
+
 Step 3: Visualize Parameters and Warp
 
 The estimated parameters (translations and rotations) are visualized as motion curves. Optionally, transformed coordinates can be rendered, and aligned volumes exported using Nibabel. The included show() function allows visualization of 2D slices before and after alignment.
