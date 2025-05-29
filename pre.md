@@ -269,7 +269,7 @@ for i in prange(...):
 ## 优化三：JIT 加速与并行循环（Numba）
 ### 相关库： `numba`
 ### 优化说明：
-三重 for-loop 是图像处理中的瓶颈，初始版本直接使用原生 Python 实现，执行效率极低。最终版本使用 @njit(parallel=True) 修饰函数，编译为高性能本地代码，并开启线程级并行。
+三重 for-loop 是图像处理中的瓶颈，初始版本直接使用原生 Python 实现，执行效率极低。最终版本使用 @njit(parallel=True)  修饰函数，编译为高性能本地代码，并使用parallel=True开启线程级并行，等价于使用 C 语言中的 OpenMP 并行方式（多线程）
 ### 初始版本代码片段：
 ```python
 def get_new_img(...):
