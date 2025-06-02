@@ -1,6 +1,6 @@
 # data/*
-*.png
-*.nil
+# *.png
+# *.nil
 
 # Python
 __pycache__/
