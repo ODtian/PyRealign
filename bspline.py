@@ -15,6 +15,7 @@ import jax.scipy as jsp
 import jax.scipy.spatial
 import jax.scipy.spatial.transform
 import nibabel as nib
+from jax.sharding import NamedSharding, PositionalSharding, PartitionSpec as P
 from matplotlib import pyplot as plt
 
 # JAX 默认使用 32 位浮点数，如果需要 64 位，可以取消注释下一行
@@ -37,9 +38,7 @@ from matplotlib import pyplot as plt
 
 
 @partial(jax.jit, static_argnames=["degree"])
-def B_spline_basis_functions(
-    span_idx: int, t: float, degree: int, knots: jnp.ndarray
-) -> jnp.ndarray:
+def B_spline_basis_functions(span_idx: int, t: float, degree: int, knots: jnp.ndarray) -> jnp.ndarray:
     # return non-empty basis weight of degree p at t
     start_span = span_idx - degree
 
@@ -151,26 +150,20 @@ class BSpline:
             )
         else:
             if mode is not None:
-                self.data = jnp.pad(
-                    data, ((degree, degree),) * self.dim + ((0, 0),), mode=mode
-                )
+                self.data = jnp.pad(data, ((degree, degree),) * self.dim + ((0, 0),), mode=mode)
                 self.knots = tuple(
-                    jnp.arange(-degree, axis + 2 * degree + 1, dtype=jnp.float32)
-                    - offset
+                    jnp.arange(-degree, axis + 2 * degree + 1, dtype=jnp.float32) - offset
                     for axis in data.shape[:-1]
                 )
 
             else:
                 self.data = data
                 self.knots = tuple(
-                    jnp.arange(0, axis + self.order, dtype=jnp.float32) - offset
-                    for axis in data.shape[:-1]
+                    jnp.arange(0, axis + self.order, dtype=jnp.float32) - offset for axis in data.shape[:-1]
                 )
 
         self.block_shape = (self.degree + 1,) * self.dim + (self.data.shape[-1],)
-        self.basis_shapes = tuple(
-            (1,) * i + (self.order,) + (1,) * (self.dim - i) for i in range(self.dim)
-        )
+        self.basis_shapes = tuple((1,) * i + (self.order,) + (1,) * (self.dim - i) for i in range(self.dim))
 
     def tree_flatten(self):
         return (self.data,), (
@@ -197,12 +190,9 @@ class BSpline:
             obj.basis_shapes,
         ) = aux_data
         return obj
-        # (data,) = children
-        # degree, mode = aux_data
-        # return cls(data, degree, mode)
 
-    # @jax.jit
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # return self.interplot(x)
         return BSpline._interplot(
             x,
             self.data,
@@ -212,49 +202,6 @@ class BSpline:
             self.degree,
             self.mode,
         )
-
-    @partial(jax.jit, static_argnames=["self"])
-    def interplot(self, x: jnp.ndarray) -> jnp.ndarray:
-        if self.mode is None:
-            x = jnp.array(
-                tuple(
-                    jnp.clip(xi, knots[self.degree], knots[-self.degree - 1])
-                    for xi, knots in zip(x, self.knots)
-                )
-            )
-
-        spans = tuple(
-            jnp.searchsorted(knots, xi, side="right") - 1 - self.degree
-            for xi, knots in zip(x, self.knots)
-        )
-        result = jax.lax.dynamic_slice(self.data, jnp.r_[spans, 0], self.block_shape)
-        # print(result)
-        for xi, span, knots, shape in zip(x, spans, self.knots, self.basis_shapes):
-            valid_knots = jax.lax.dynamic_slice(knots, (span,), (2 * self.degree + 2,))
-            # print(f"{valid_knots=}")
-            # print(f"{b.reshape(shape[:-1])}")
-            r = B(xi, valid_knots, self.degree).reshape(shape)
-
-            # print(r)
-            result *= r
-            # print(f"{result=}")
-
-            # print(f"{result=}")
-        return result.sum()
-        # print(self.data.reshape(self.data.shape[:-1]))
-        # print(self.knots)
-        # print(f"{self.knots[0].shape}")
-        # print(self.data.shape)
-
-        # return BSpline._interplot(
-        #     x,
-        #     self.data,
-        #     self.knots,
-        #     self.block_shape,
-        #     self.basis_shapes,
-        #     self.degree,
-        #     self.mode,
-        # )
 
     @staticmethod
     @partial(jax.jit, static_argnames=["block_shape", "basis_shapes", "degree", "mode"])
@@ -269,23 +216,17 @@ class BSpline:
     ):
         if mode is None:
             x = jnp.array(
-                tuple(
-                    jnp.clip(xi, knots[degree], knots[-degree - 1])
-                    for xi, knots in zip(x, knots)
-                )
+                tuple(jnp.clip(xi, knots[degree], knots[-degree - 1]) for xi, knots in zip(x, knots))
             )
 
-        spans = tuple(
-            jnp.searchsorted(knots, xi, side="right") - 1 - degree
-            for xi, knots in zip(x, knots)
-        )
+        spans = tuple(jnp.searchsorted(knots, xi, side="right") - 1 - degree for xi, knots in zip(x, knots))
         result = jax.lax.dynamic_slice(data, jnp.r_[spans, 0], block_shape)
         # print(result)
-        for xi, span, knots, shape in zip(x, spans, knots, basis_shapes):
-            valid_knots = jax.lax.dynamic_slice(knots, (span,), (2 * degree + 2,))
+        for xi, span, knot, shape in zip(x, spans, knots, basis_shapes):
+            valid_knot = jax.lax.dynamic_slice(knot, (span,), (2 * degree + 2,))
             # print(f"{valid_knots=}")
             # print(f"{b.reshape(shape[:-1])}")
-            r = B(xi, valid_knots, degree).reshape(shape)
+            r = B(xi, valid_knot, degree).reshape(shape)
 
             # print(r)
             result *= r
@@ -304,7 +245,7 @@ def value_and_jacfwd(f, x):
 
 @jax.tree_util.register_pytree_node_class
 class Realign:
-    def __init__(self, path, sigma=1, iteration=1, degree=2, step=2, alpha=1, beta=1.2):
+    def __init__(self, path, sigma=1, iteration=1, degree=2, step=2, alpha=1.0, beta=1.2):
         """初始化(initialization)\n
         输入参数(parameter):\n
         path:文件路径(file path)
@@ -340,14 +281,11 @@ class Realign:
         self.voxel_steps = self.step * spacing[1:]
         # self.voxel_steps = 1
         grids = jnp.meshgrid(
-            *(
-                jnp.arange(0, axis, voxel_step)
-                for axis, voxel_step in zip(self.data_shape, self.voxel_steps)
-            )
+            *(jnp.arange(0, axis, voxel_step) for axis, voxel_step in zip(self.data_shape, self.voxel_steps))
         )
-        self.sample_coords = jnp.stack(
-            (*grids, jnp.ones(grids[0].shape)), axis=-1
-        ).reshape((-1, self.ims.ndim))
+        self.sample_coords = jnp.stack((*grids, jnp.ones(grids[0].shape)), axis=-1).reshape(
+            (-1, self.ims.ndim)
+        )
 
         # self.x, self.y, self.z = (
         #     int(self.shape[1] / self.affine[1, 1] // self.step),
@@ -364,14 +302,14 @@ class Realign:
         #     "图片载入成功,请耐心等待:) \nimage loaded successfully,please wait patiently"
         # )
 
-    def gaussian(self):
-        x = jnp.stack(jnp.indices((3, 3, 3, 3)), axis=-1)
-        # x = jnp.linspace(-3, 3, 7)
-        pdf = jsp.stats.norm.pdf(x)
-        jsp.signal.correlate()
-        # window = pdf * pdf[:, None] * pdf[:, :, None]
-        # jnp.meshg
-        # smooth_image = jsp.signal.convolve(self., window, mode='same')
+    # def gaussian(self):
+    #     x = jnp.stack(jnp.indices((3, 3, 3, 3)), axis=-1)
+    #     # x = jnp.linspace(-3, 3, 7)
+    #     pdf = jsp.stats.norm.pdf(x)
+    #     jsp.signal.correlate()
+    #     # window = pdf * pdf[:, None] * pdf[:, :, None]
+    #     # jnp.meshg
+    #     # smooth_image = jsp.signal.convolve(self., window, mode='same')
 
     # @jax.jit
     def iterate(self, q: jnp.ndarray, interpolator: BSpline):
@@ -533,9 +471,7 @@ class Realign:
             #     @ diff_b.T
             #     @ b
             # )
-            m = jsp.linalg.solve(
-                diff_b.T @ diff_b, diff_b.T @ b, overwrite_a=True, overwrite_b=True
-            )
+            m = jsp.linalg.solve(diff_b.T @ diff_b, diff_b.T @ b, overwrite_a=True, overwrite_b=True)
             q -= self.alpha * m
             # plt.plot(jnp.arange(self.sample_coords.shape[0]), b, "r.")
             # plt.plot(jnp.arange(7), m, "r.")
@@ -546,15 +482,17 @@ class Realign:
         # q[q > 40] = 0
         # q[q < -40] = 0
         M = self.rigid(q)
-        print(M)
-        coord = jnp.stack(
-            (*jnp.indices(self.data_shape), jnp.ones(self.data_shape)), axis=-1
-        ).reshape((-1, 4))
-        coord = jax.vmap(lambda x: M @ x, in_axes=0)(coord)
-        print(coord)
+        # print(M)
+        coord = jnp.stack((*jnp.indices(self.data_shape), jnp.ones(self.data_shape)), axis=-1).reshape(
+            (-1, 4)
+        )
+        # coord = jax.vmap(lambda x: M @ x, in_axes=0)(coord)
+
+        resampled = jax.vmap(lambda x: interpolator((M @ x)[:-1]), in_axes=0)(coord).reshape(self.data_shape)
+        # print(coord)
         # print(coord)
         # return jnp.r_[q, m]
-        return q, 0
+        return q, resampled
 
     # jax.vmap(interpolator, in_axes=0)(coord).reshape(self.data_shape)
 
@@ -640,6 +578,14 @@ class Realign:
         # coor = self.v2d()
         # return np.linalg.inv(coor) @ M_r @ coor
 
+    def save(self, aligned, name):
+        img = jnp.transpose(aligned, (3, 2, 1, 0))  # 将图片转换为nii格式就要按nii的顺序排列
+        # img = nib.Nifti1Image(img, self.affine)
+        img = nib.nifti1.Nifti1Image(img, self.affine)
+        name = f"{name}.nii.gz"
+        nib.loadsave.save(img, name)
+        print(f"图片{name}保存成功")
+
     def draw_parameter(self, parameter):
         """
         绘制刚体变换参数\n
@@ -676,6 +622,272 @@ class Realign:
         plt.show()
 
 
+def main_test():
+    jax.config.update("jax_compilation_cache_dir", "./jax_cache")
+
+    # 1. 定义一个对单个向量进行“昂贵”操作的函数
+    #    这个函数将包含一些重复的计算。
+    def expensive_operation_on_single_vector(
+        vector: jnp.ndarray,
+        matrix_a: jnp.ndarray,
+        matrix_b: jnp.ndarray,
+        num_iterations: int,
+    ) -> jnp.ndarray:
+        """
+        对单个向量执行一系列计算密集型操作。
+        num_iterations 必须是静态的，以便JIT可以展开循环。
+        """
+        v_current = vector
+        for _ in range(num_iterations):
+            # 一些任意的、但会占用计算资源的线性代数和逐元素操作
+            transform_a = jnp.dot(matrix_a, v_current)
+            transform_b = jnp.dot(matrix_b, v_current[::-1])  # 使用翻转的向量增加一点变化
+            v_current = jnp.tanh(transform_a - transform_b)
+            v_current = v_current * jnp.sin(v_current) + jnp.cos(v_current)
+            # 规范化以防止值爆炸或消失 (可选，但对迭代过程有好处)
+            v_current = v_current / (jnp.linalg.norm(v_current) + 1e-6)
+        return jnp.sum(v_current**2)  # 返回一个标量结果
+
+    # --- 参数配置 ---
+    vector_size = 1024  # 每个向量的维度
+    batch_size = 200000  # 我们要处理的向量数量 (调大这个值以更好地观察并行效果)
+    iterations_per_vector = 15  # 每个向量内部的迭代次数 (增加这个值会使单次调用更耗时)
+
+    print(
+        f"配置: vector_size={vector_size}, batch_size={batch_size}, iterations_per_vector={iterations_per_vector}"
+    )
+    print(f"预计总操作数级别: {batch_size * iterations_per_vector * (vector_size**2) * 2} (粗略估计矩阵乘法)")
+    print("-" * 30)
+
+    # --- 数据生成 ---
+    key = jax.random.PRNGKey(42)
+    key_batch, key_m1, key_m2 = jax.random.split(key, 3)
+
+    # 一批输入向量
+    batch_of_vectors = jax.random.normal(key_batch, (batch_size, vector_size))
+
+    # 用于操作的固定矩阵 (这些矩阵将在所有向量操作中重复使用)
+    # 确保它们的形状与 vector_size 兼容
+    fixed_matrix_a = jax.random.normal(key_m1, (vector_size, vector_size))
+    fixed_matrix_b = jax.random.normal(key_m2, (vector_size, vector_size))
+
+    # --- 方法一: Python 循环 (相对较慢) ---
+    # 我们仍然 JIT 编译单次操作函数，以公平比较 JAX 的计算部分
+    # 但 Python 循环本身会引入开销，并且不能在批处理维度上实现 XLA 级别的并行。
+    # jitted_single_op = jax.jit(
+    #     expensive_operation_on_single_vector, static_argnums=(3,)
+    # )  # num_iterations 是静态的
+
+    # print("运行方法一: Python 循环 + JIT编译的单项操作...")
+    # # 预热/编译 (如果 jitted_single_op 尚未编译)
+    # _ = jitted_single_op(
+    #     batch_of_vectors[0], fixed_matrix_a, fixed_matrix_b, iterations_per_vector
+    # ).block_until_ready()
+
+    # start_time_loop = time.time()
+    # results_loop = []
+    # for i in range(batch_size):
+    #     result = jitted_single_op(
+    #         batch_of_vectors[i], fixed_matrix_a, fixed_matrix_b, iterations_per_vector
+    #     )
+    #     results_loop.append(result)
+
+    # # 将结果列表转换为 JAX 数组并确保计算完成
+    # if results_loop:  # 确保列表不为空
+    #     final_results_loop = jnp.stack(results_loop)
+    #     final_results_loop.block_until_ready()  # 等待所有计算完成
+    # else:
+    #     final_results_loop = jnp.array([])
+
+    # end_time_loop = time.time()
+    # time_py_loop = end_time_loop - start_time_loop
+    # print(f"Python 循环耗时: {time_py_loop:.4f} 秒")
+    # print("-" * 30)
+
+    # --- 方法二: jax.vmap + jax.jit (向量化，期望更快) ---
+    print("运行方法二: jax.vmap + jax.jit...")
+    print("请在此时观察您的 CPU/GPU 利用率 (例如使用 htop 或 nvidia-smi)")
+
+    # 1. 使用 vmap 向量化单项操作函数
+    #    in_axes: 指定如何映射输入参数
+    #       0: 对 batch_of_vectors 的第一个轴 (批处理轴) 进行映射
+    #       None: fixed_matrix_a 和 fixed_matrix_b 不映射，广播给所有调用
+    #       None: num_iterations (静态参数) 也不映射
+    vmapped_expensive_op = jax.vmap(
+        expensive_operation_on_single_vector,
+        in_axes=(
+            0,
+            None,
+            None,
+            None,
+        ),  # 对应 vector, matrix_a, matrix_b, num_iterations
+        out_axes=0,  # 结果也沿着第一个轴堆叠
+    )
+
+    # 2. JIT 编译向量化后的函数
+    #    num_iterations 仍然需要是静态的。
+    #    当 vmapped_expensive_op 被调用时，num_iterations 会被传入。
+    #    我们需要确保JIT知道这个参数是静态的。
+    @partial(jax.jit, static_argnums=(3,))  # num_iterations 是第四个参数 (索引为3)
+    def run_vmapped_jitted(vectors, mat_a, mat_b, num_iter_static):
+        return vmapped_expensive_op(vectors, mat_a, mat_b, num_iter_static)
+
+    # 预热/编译
+    print("JIT 编译 (预热)...")
+    _ = run_vmapped_jitted(
+        batch_of_vectors, fixed_matrix_a, fixed_matrix_b, iterations_per_vector
+    ).block_until_ready()
+    print("预热完成.")
+
+    start_time_vmap = time.time()
+    results_vmap_jit = run_vmapped_jitted(
+        batch_of_vectors, fixed_matrix_a, fixed_matrix_b, iterations_per_vector
+    )
+    results_vmap_jit.block_until_ready()  # 等待所有计算完成
+    end_time_vmap = time.time()
+    time_vmap_jit_total = end_time_vmap - start_time_vmap
+    print(f"jax.vmap + jax.jit 耗时: {time_vmap_jit_total:.4f} 秒")
+    print("-" * 30)
+
+    # --- 结果比较 ---
+    print("性能比较:")
+    if time_vmap_jit_total > 0:
+        speedup = time_py_loop / time_vmap_jit_total
+        print(f"  vmap + jit 比 Python 循环快 {speedup:.2f} 倍")
+    else:
+        print("  vmap + jit 执行时间过短，无法计算有效加速比。")
+
+    # (可选) 检查结果是否一致 (应该非常接近，除了可能的浮点精度差异)
+    # diff = jnp.abs(final_results_loop - results_vmap_jit).max()
+    # print(f"两种方法结果的最大差异: {diff}")
+
+    print("\n--- 如何“看到”向量化/并行化 ---")
+    print(
+        "1. **执行时间**: `jax.vmap + jax.jit` 版本应该比 Python 循环版本快得多，特别是当 `batch_size` 很大时。"
+    )
+    print("2. **CPU/GPU 利用率**: 在 `jax.vmap + jax.jit` 版本运行时 (特别是在打印“预热完成”之后的那几秒):")
+    print(
+        "   - **CPU**: 打开系统监视器 (Linux/macOS: `htop`; Windows: 任务管理器)。你应该看到多个 CPU 核心的利用率显著上升。"
+    )
+    print(
+        "   - **GPU (如果 JAX 配置为使用 GPU)**: 运行 `nvidia-smi` (NVIDIA) 或 `rocm-smi` (AMD)。你应该看到 GPU 利用率 (GPU-Util) 和内存使用量增加。"
+    )
+    print("3. **调整参数**: ")
+    print("   - 增加 `batch_size` 会让并行化的优势更明显。")
+    print(
+        "   - 增加 `iterations_per_vector` 或 `vector_size` 会增加每个单独任务的计算量，这也有助于观察并行效果，因为并行开销占比会降低。"
+    )
+
+
+def main_map():
+    jax.config.update("jax_compilation_cache_dir", "./jax_cache")
+    jax.config.update("jax_optimization_level", "O3")
+    jax.config.update("jax_log_compiles", True)
+    # jax.config.update("jax_num_cpu_devices", 200)
+    # jax.config.update("jax_memory_fitting_effort", 1.0)
+
+    # jax.config.update("jax_explain_cache_misses", True)
+    # jax.config.update("jax_log_compiles", True)
+    # jax.config.update("jax_logging_level", "INFO")
+    t1 = time.time()
+    realign = Realign(
+        r"data\sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz",
+        # r"test.nii",
+        degree=3,
+        iteration=100,
+        step=1,
+        alpha=0.15,
+        beta=1.65,
+    )
+    t2 = time.time()
+    print(f"t2 - t1 = {t2 - t1:.4f}")
+
+    def block_indices(indices, block_size=20):
+        num_items = indices.shape[0]
+
+        # 计算填充细节
+        num_blocks = (num_items + block_size - 1) // block_size
+        padded_len = num_blocks * block_size
+        padding_amount = padded_len - num_items
+
+        # 填充索引。使用第一个有效索引进行填充。
+        # 来自填充索引的结果将被修剪。
+        # 在访问 all_indices[0] 之前确保 all_indices 不为空
+        return jnp.pad(indices, (0, padding_amount), constant_values=indices[0]).reshape(
+            (num_blocks, block_size)
+        )
+
+    # JIT 编译的函数，用于使用 jax.lax.map 分块计算结果
+    # @jax.jit
+    def compute_results_in_blocks(indices, block_size=20):
+        # data_blocks_input 的形状为 (num_blocks, block_size)
+
+        # 将 process_single_block 应用于每个块
+        # v_block_results 的形状将为 (num_blocks, block_size, 7)
+        # aligned_block_results 的形状将为 (num_blocks, block_size)
+        num_items = indices.shape[0]
+        blocked_indices = block_indices(indices, block_size)
+        estimate = jax.vmap(realign.estimate, in_axes=0)
+        v_results, aligned_results = jax.lax.map(estimate, blocked_indices)
+
+        # 重塑以展平块维度
+        # 假设 realign_obj.estimate 返回 (q_shape=(7,), scalar_shape=())
+        # 因此，v_item_shape_tail 为 (7,)，aligned_item_shape_tail 为 ()
+        flat_v_results = v_results.reshape(-1, *v_results.shape[2:])
+        flat_aligned_results = aligned_results.reshape(-1, *aligned_results.shape[2:])
+
+        # 将结果修剪为原始项目数以移除填充
+        final_v_output = flat_v_results[:num_items]
+        final_aligned_output = flat_aligned_results[:num_items]
+
+        return (
+            final_v_output.block_until_ready(),
+            final_aligned_output.block_until_ready(),
+        )
+
+    # 执行分块计算
+    v, aligned = compute_results_in_blocks(jnp.arange(200).repeat(20), 20)
+    print(v)
+    print(aligned.shape)
+    print(f"t3 - t2 = {time.time() - t2:.4f}")
+    # realign.draw_parameter(v)
+
+
+def main_shard():
+    jax.config.update("jax_compilation_cache_dir", "./jax_cache")
+    # jax.config.update("jax_optimization_level", "O3")
+    jax.config.update("jax_log_compiles", True)
+    jax.config.update("jax_num_cpu_devices", 16)
+
+    t1 = time.time()
+    realign = Realign(
+        r"data\sub-Ey153_ses-3_task-rest_acq-EPI_run-1_bold.nii.gz",
+        # r"test.nii",
+        degree=3,
+        iteration=100,
+        step=1,
+        alpha=0.15,
+        beta=1.65,
+    )
+    t2 = time.time()
+    print(f"t2 - t1 = {t2 - t1:.4f}")
+    # sharding = PositionalSharding(jax.devices())
+
+    # sharding = NamedSharding()
+    mesh = jax.make_mesh((16,), ("x",))
+
+    sharding = NamedSharding(mesh, P("x"))
+    # G = jax.local_device_count()
+    # sharded_x = jax.device_put(jnp.arange(1, 200), sharding.reshape(G, 1))
+    sharded_x = jax.device_put(jnp.arange(1, 193), sharding)
+    jax.debug.visualize_array_sharding(sharded_x)
+    v, aligned = jax.jit(jax.vmap(realign.estimate, in_axes=0))(sharded_x)
+    # print(v)
+    v.block_until_ready()
+    print(aligned.shape)
+    print(f"t3 - t2 = {time.time() - t2:.4f}")
+
+
 def main():
     jax.config.update("jax_compilation_cache_dir", "./jax_cache")
     jax.config.update("jax_optimization_level", "O3")
@@ -710,7 +922,8 @@ def main():
     # v, aligned = jax.lax.map(
     #     realign.estimate, jnp.arange(1, 200).repeat(20), batch_size=30
     # )
-    v, aligned = jax.jit(jax.vmap(realign.estimate, in_axes=0))(jnp.arange(1, 200))
+    with jax.profiler.trace("./jax-trace", create_perfetto_link=True):
+        v, aligned = jax.jit(jax.vmap(realign.estimate, in_axes=0))(jnp.arange(1, 200))
     # v, aligned = jax.pmap(
     #     realign.estimate,
     #     in_axes=0,
@@ -721,8 +934,6 @@ def main():
     # print(realign.estimate.lower(realign, 1).cost_analysis())
     # jax.lax.map
     # print(jax.make_jaxpr(realign.estimate)(1))
-    print(aligned.shape)
-    jax.tree.map
     # jax.scipy.interpolate.RegularGridInterpolator
     # v = jax.pmap(realign.estimate, in_axes=0)(jnp.arange(1, 16))
     # _ = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
@@ -737,8 +948,7 @@ def main():
     # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200)).block_until_ready()
     # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200)).block_until_ready()
     # plt.imshow(d)
-    print(v.shape)
-    print(v)
+    v.block_until_ready()
     # img = jnp.transpose(aligned, (3, 2, 1, 0))  # 将图片转换为nii格式就要按nii的顺序排列
     # img = nib.Nifti1Image(img, realign.affine)
     # img.to_filename("tested.nii.gz")
@@ -768,9 +978,7 @@ def show():
         if padding_needed > 0:
             # 创建填充块
             padding_shape = (padding_needed, H, W)
-            padding_block = jnp.full(
-                padding_shape, background_value, dtype=voxel_data.dtype
-            )
+            padding_block = jnp.full(padding_shape, background_value, dtype=voxel_data.dtype)
             # 将填充块连接到原始数据后面 (沿着第一个轴)
             padded_data = jnp.concatenate([voxel_data, padding_block], axis=0)
         else:
