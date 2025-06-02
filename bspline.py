@@ -1,15 +1,8 @@
-import dataclasses
-import string
 import time
 from functools import partial
-from typing import Literal
 
 import itk
 import jax
-import jax.experimental
-import jax.experimental.pjit
-import jax.experimental.shard_map
-import jax.export
 import jax.numpy as jnp
 import jax.scipy as jsp
 import jax.scipy.spatial
@@ -334,6 +327,7 @@ class Realign:
             # )
             # transformed_coord = ( coord)[:-1]
             return data(coord[:-1]) - ref((transform @ coord)[:-1])
+            # return data(transform @ coord[:-1]) - ref
 
         @jax.value_and_grad
         def b_func2(q, _, coord, data, ref, sample_size):
@@ -366,18 +360,20 @@ class Realign:
         # im = self.ims[data_index]
         # interpolator = BSpline(im[..., None], self.degree, mode="reflect")
         # transform, grad = jax.value_and_grad(self.rigid)(q)
+        # transform, jac = value_and_jacfwd(lambda q: jnp.linalg.inv(self.rigid(q)), q)
         transform, jac = value_and_jacfwd(self.rigid, q)
         # transform_inv = jnp.where(
         #     jnp.linalg.det(transform) == 0,
         #     jnp.linalg.pinv(transform),
         #     jnp.linalg.inv(transform),
         # )
-        jax.lax.map
+        # jax.lax.map
         value, grad = jax.vmap(b_func, in_axes=(None, 0, None, None, None))(
             transform,
             self.sample_coords,
             interpolator,
             self.ref_interpolator,
+            # self.ims[0].reshape(-1),
             self.data_shape,
         )
 
@@ -493,6 +489,7 @@ class Realign:
         # print(coord)
         # return jnp.r_[q, m]
         return q, resampled
+        return q, resampled
 
     # jax.vmap(interpolator, in_axes=0)(coord).reshape(self.data_shape)
 
@@ -532,49 +529,49 @@ class Realign:
         )
 
     def rigid(self, q):
-        # return (
-        #     self.inv_v2d
-        #     @ jnp.eye(4).at[:3, 3].set(q[1:4])
-        #     @ jnp.eye(4)
-        #     .at[:3, :3]
-        #     .set(
-        #         jax.scipy.spatial.transform.Rotation.from_euler(
-        #             "zyx", q[4:7]
-        #         ).as_matrix()
-        #     )
-        #     @ self.v2d
+        return (
+            self.inv_v2d
+            @ jnp.eye(4).at[:3, 3].set(q[1:4])
+            @ jnp.eye(4)
+            .at[:3, :3]
+            .set(
+                jax.scipy.spatial.transform.Rotation.from_euler(
+                    "zyx", q[4:7]
+                ).as_matrix()
+            )
+            @ self.v2d
+        )
+        # T = jnp.array([[1, 0, 0, q[1]], [0, 1, 0, q[2]], [0, 0, 1, q[3]], [0, 0, 0, 1]])
+        # # 旋转矩阵(Rotation matrix)
+        # R_x = jnp.array(
+        #     [
+        #         [1, 0, 0, 0],
+        #         [0, jnp.cos(q[4]), jnp.sin(q[4]), 0],
+        #         [0, -jnp.sin(q[4]), jnp.cos(q[4]), 0],
+        #         [0, 0, 0, 1],
+        #     ]
         # )
-        T = jnp.array([[1, 0, 0, q[1]], [0, 1, 0, q[2]], [0, 0, 1, q[3]], [0, 0, 0, 1]])
-        # 旋转矩阵(Rotation matrix)
-        R_x = jnp.array(
-            [
-                [1, 0, 0, 0],
-                [0, jnp.cos(q[4]), jnp.sin(q[4]), 0],
-                [0, -jnp.sin(q[4]), jnp.cos(q[4]), 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        R_y = jnp.array(
-            [
-                [jnp.cos(q[5]), 0, jnp.sin(q[5]), 0],
-                [0, 1, 0, 0],
-                [-jnp.sin(q[5]), 0, jnp.cos(q[5]), 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        R_z = jnp.array(
-            [
-                [jnp.cos(q[6]), jnp.sin(q[6]), 0, 0],
-                [-jnp.sin(q[6]), jnp.cos(q[6]), 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        R = R_x @ R_y @ R_z
+        # R_y = jnp.array(
+        #     [
+        #         [jnp.cos(q[5]), 0, jnp.sin(q[5]), 0],
+        #         [0, 1, 0, 0],
+        #         [-jnp.sin(q[5]), 0, jnp.cos(q[5]), 0],
+        #         [0, 0, 0, 1],
+        #     ]
+        # )
+        # R_z = jnp.array(
+        #     [
+        #         [jnp.cos(q[6]), jnp.sin(q[6]), 0, 0],
+        #         [-jnp.sin(q[6]), jnp.cos(q[6]), 0, 0],
+        #         [0, 0, 1, 0],
+        #         [0, 0, 0, 1],
+        #     ]
+        # )
+        # R = R_x @ R_y @ R_z
 
-        M_r = T @ R
-        # 坐标系转换矩阵(coordinate system transformation matrix)
-        return self.inv_v2d @ M_r @ self.v2d
+        # M_r = T @ R
+        # # 坐标系转换矩阵(coordinate system transformation matrix)
+        # return self.inv_v2d @ M_r @ self.v2d
         # coor = self.v2d()
         # return np.linalg.inv(coor) @ M_r @ coor
 
@@ -908,7 +905,7 @@ def main():
     )
     # v = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 200))
     t1 = time.time()
-    print(jax.devices())
+    # print(jax.devices())
     # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
     # v = realign.estimate(1).reshape((-1, 8))
     # v, aligned = jax.vmap(realign.estimate, in_axes=0)(jnp.arange(1, 16))
